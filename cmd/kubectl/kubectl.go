@@ -27,9 +27,11 @@ import (
 
 	utilflag "k8s.io/apiserver/pkg/util/flag"
 	"k8s.io/kubernetes/pkg/kubectl/cmd"
+	"k8s.io/kubernetes/pkg/kubectl/dispatcher/pkg/dispatcher"
 	"k8s.io/kubernetes/pkg/kubectl/util/logs"
 
 	// Import to initialize client auth plugins.
+	"k8s.io/client-go/pkg/version"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
 
@@ -46,6 +48,13 @@ func main() {
 	// utilflag.InitFlags()
 	logs.InitLogs()
 	defer logs.FlushLogs()
+
+	// Checks the server version, and executes the matching kubectl version. The convention
+	// for the versioned kubectl binary is: kubectl.<MAJOR>.<MINOR>. Example: kubectl.1.12
+	// This versioned kubectl binary MUST be in the same directory as this kubectl binary.
+	// This does NOT return if it successfully delegates to another version of kubectl,
+	// since the current process is overwritten (see execve(2)).
+	dispatcher.Execute(version.Get())
 
 	if err := command.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
