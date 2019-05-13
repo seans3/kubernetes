@@ -65,7 +65,7 @@ echo
 build/run.sh make clean
 echo "Cleaning up: make test-cmd"
 echo
-build/run.sh make test-cmd
+# build/run.sh make test-cmd
 echo
 echo
 
