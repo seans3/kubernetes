@@ -73,8 +73,9 @@ func TestServerSupportsVersion(t *testing.T) {
 			statusCode:     http.StatusOK,
 		},
 		{
-			name:            "discovery fails due to 404 Not Found errors and thus serverVersions is empty, use requested GroupVersion",
+			name:            "discovery fails due to 404",
 			requiredVersion: schema.GroupVersion{Version: "version1"},
+			expectErr:       func(err error) bool { return strings.Contains(err.Error(), `could not find the requested resource`) },
 			statusCode:      http.StatusNotFound,
 		},
 	}

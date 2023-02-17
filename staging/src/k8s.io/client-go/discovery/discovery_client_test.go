@@ -128,14 +128,10 @@ func TestGetServerGroupsWithBrokenServer(t *testing.T) {
 		}))
 		defer server.Close()
 		client := NewDiscoveryClientForConfigOrDie(&restclient.Config{Host: server.URL})
-		// ServerGroups should not return an error even if server returns Not Found or Forbidden error at all end points
-		apiGroupList, err := client.ServerGroups()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		groupVersions := metav1.ExtractGroupVersions(apiGroupList)
-		if len(groupVersions) != 0 {
-			t.Errorf("expected empty list, got: %q", groupVersions)
+		// ServerGroups should return an error for 404 and 403.
+		_, err := client.ServerGroups()
+		if err == nil {
+			t.Fatal("expected error, received none")
 		}
 	}
 }
@@ -144,42 +140,6 @@ func TestTimeoutIsSet(t *testing.T) {
 	cfg := &restclient.Config{}
 	setDiscoveryDefaults(cfg)
 	assert.Equal(t, defaultTimeout, cfg.Timeout)
-}
-
-func TestGetServerResourcesWithV1Server(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		var obj interface{}
-		switch req.URL.Path {
-		case "/api":
-			obj = &metav1.APIVersions{
-				Versions: []string{
-					"v1",
-				},
-			}
-		default:
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		output, err := json.Marshal(obj)
-		if err != nil {
-			t.Errorf("unexpected encoding error: %v", err)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(output)
-	}))
-	defer server.Close()
-	client := NewDiscoveryClientForConfigOrDie(&restclient.Config{Host: server.URL})
-	// ServerResources should not return an error even if server returns error at /api/v1.
-	_, serverResources, err := client.ServerGroupsAndResources()
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	gvs := groupVersions(serverResources)
-	if !sets.NewString(gvs...).Has("v1") {
-		t.Errorf("missing v1 in resource list: %v", serverResources)
-	}
 }
 
 func TestGetServerResourcesForGroupVersion(t *testing.T) {
@@ -975,10 +935,6 @@ func TestServerPreferredNamespacedResources(t *testing.T) {
 							"v1",
 						},
 					}
-				default:
-					t.Logf("unexpected request: %s", req.URL.Path)
-					w.WriteHeader(http.StatusNotFound)
-					return
 				}
 				output, err := json.Marshal(list)
 				if err != nil {
@@ -1018,10 +974,6 @@ func TestServerPreferredNamespacedResources(t *testing.T) {
 					list = &batchv2alpha1
 				case "/apis/batch/v3alpha1":
 					list = &batchv3alpha1
-				default:
-					t.Logf("unexpected request: %s", req.URL.Path)
-					w.WriteHeader(http.StatusNotFound)
-					return
 				}
 				output, err := json.Marshal(list)
 				if err != nil {
@@ -1061,10 +1013,6 @@ func TestServerPreferredNamespacedResources(t *testing.T) {
 					list = &batchv2alpha1
 				case "/apis/batch/v3alpha1":
 					list = &batchv3alpha1
-				default:
-					t.Logf("unexpected request: %s", req.URL.Path)
-					w.WriteHeader(http.StatusNotFound)
-					return
 				}
 				output, err := json.Marshal(list)
 				if err != nil {
