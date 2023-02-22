@@ -273,9 +273,6 @@ func (d *memCacheClient) serverResourcesForGroupVersion(groupVersion string) (*m
 	if err != nil {
 		return r, err
 	}
-	if len(r.APIResources) == 0 {
-		return r, fmt.Errorf("Got empty response for: %v", groupVersion)
-	}
 	return r, nil
 }
 
