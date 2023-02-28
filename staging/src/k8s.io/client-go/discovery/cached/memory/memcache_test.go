@@ -599,7 +599,7 @@ func TestMemCacheGroupsAndMaybeResources(t *testing.T) {
 			groupToServerResources: map[string]*cacheEntry{},
 		}
 		assert.False(t, memClient.Fresh())
-		apiGroupList, resourcesMap, err := memClient.GroupsAndMaybeResources()
+		apiGroupList, resourcesMap, _, err := memClient.GroupsAndMaybeResources()
 		require.NoError(t, err)
 		// "Unaggregated" discovery always returns nil for resources.
 		assert.Nil(t, resourcesMap)
@@ -618,7 +618,7 @@ func TestMemCacheGroupsAndMaybeResources(t *testing.T) {
 		// Invalidate the cache and retrieve the server groups and resources again.
 		memClient.Invalidate()
 		assert.False(t, memClient.Fresh())
-		apiGroupList, resourcesMap, err = memClient.GroupsAndMaybeResources()
+		apiGroupList, resourcesMap, _, err = memClient.GroupsAndMaybeResources()
 		require.NoError(t, err)
 		assert.Nil(t, resourcesMap)
 		assert.False(t, memClient.receivedAggregatedDiscovery)
@@ -1054,7 +1054,7 @@ func TestAggregatedMemCacheGroupsAndMaybeResources(t *testing.T) {
 			groupToServerResources: map[string]*cacheEntry{},
 		}
 		assert.False(t, memClient.Fresh())
-		apiGroupList, resourcesMap, err := memClient.GroupsAndMaybeResources()
+		apiGroupList, resourcesMap, _, err := memClient.GroupsAndMaybeResources()
 		require.NoError(t, err)
 		assert.True(t, memClient.receivedAggregatedDiscovery)
 		assert.True(t, memClient.Fresh())
@@ -1080,7 +1080,7 @@ func TestAggregatedMemCacheGroupsAndMaybeResources(t *testing.T) {
 		// Invalidate the cache and retrieve the server groups again.
 		memClient.Invalidate()
 		assert.False(t, memClient.Fresh())
-		apiGroupList, _, err = memClient.GroupsAndMaybeResources()
+		apiGroupList, _, _, err = memClient.GroupsAndMaybeResources()
 		require.NoError(t, err)
 		// Test the expected groups are returned for the aggregated format.
 		actualGroupNames = sets.NewString(groupNamesFromList(apiGroupList)...)

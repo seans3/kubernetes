@@ -637,7 +637,7 @@ func TestSplitGroupsAndResources(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		apiGroups, resourcesByGV := SplitGroupsAndResources(test.agg)
+		apiGroups, resourcesByGV, _ := SplitGroupsAndResources(test.agg)
 		assert.Equal(t, test.expectedGroups, *apiGroups)
 		assert.Equal(t, test.expectedGVResources, resourcesByGV)
 	}
