@@ -53,16 +53,20 @@ func NewClient(netConn net.Conn, u *url.URL, requestHeader http.Header, readBufS
 type Dialer struct {
 	// NetDial specifies the dial function for creating TCP connections. If
 	// NetDial is nil, net.Dialer DialContext is used.
+	// If "Proxy" field is also set, this function dials the proxy.
 	NetDial func(network, addr string) (net.Conn, error)
 
 	// NetDialContext specifies the dial function for creating TCP connections. If
 	// NetDialContext is nil, NetDial is used.
+	// If "Proxy" field is also set, this function dials the proxy.
 	NetDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// NetDialTLSContext specifies the dial function for creating TLS/TCP connections. If
 	// NetDialTLSContext is nil, NetDialContext is used.
 	// If NetDialTLSContext is set, Dial assumes the TLS handshake is done there and
 	// TLSClientConfig is ignored.
+	// If "Proxy" field is also set, this function dials the proxy (and performs
+	// the TLS handshake ignoring TLSClientConfig).
 	NetDialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Proxy specifies a function to return a proxy for a given
@@ -73,7 +77,7 @@ type Dialer struct {
 
 	// TLSClientConfig specifies the TLS configuration to use with tls.Client.
 	// If nil, the default configuration is used.
-	// If either NetDialTLS or NetDialTLSContext are set, Dial assumes the TLS handshake
+	// If NetDialTLSContext is set, that function assumes the TLS handshake
 	// is done there and TLSClientConfig is ignored.
 	TLSClientConfig *tls.Config
 
@@ -282,12 +286,24 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 			return nil, nil, err
 		}
 		if proxyURL != nil {
-			if proxyURL.Scheme == "https" {
-				netDial = func(ctx context.Context, net, addr string) (net.Conn, error) {
-					tlsDialer := tls.Dialer{
-						Config: cloneTLSConfig(d.TLSClientConfig),
+			// If the proxy is HTTPS, and the websocket dialer doesn't have a
+			// TLS dial function, then use the previously computed "netDial"
+			// function to create the connection and use TLS config to
+			// perform the TLS handshake over that connection.
+			if proxyURL.Scheme == "https" && d.NetDialTLSContext == nil {
+				proxyDial := netDial
+				netDial = func(ctx context.Context, unused, addr string) (net.Conn, error) {
+					// Creates TCP connection to addr using previously computed "netDial"
+					conn, err := proxyDial(ctx, "tcp", addr)
+					cfg := cloneTLSConfig(d.TLSClientConfig)
+					if cfg.ServerName == "" {
+						_, hostNoPort := hostPortNoPort(proxyURL)
+						cfg.ServerName = hostNoPort
 					}
-					return tlsDialer.DialContext(ctx, net, addr)
+					tlsConn := tls.Client(conn, cfg)
+					// Do the TLS handshake using TLSConfig over the wrapped connection.
+					err = doHandshake(ctx, tlsConn, cfg)
+					return tlsConn, err
 				}
 			}
 			netDial, err = proxyFromURL(proxyURL, netDial)
