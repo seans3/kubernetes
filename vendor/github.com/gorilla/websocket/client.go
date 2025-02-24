@@ -280,6 +280,7 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	}
 
 	// If needed, wrap the dial function to connect through a proxy.
+	tlsProxy := false
 	if d.Proxy != nil {
 		proxyURL, err := d.Proxy(req)
 		if err != nil {
@@ -303,6 +304,7 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 					tlsConn := tls.Client(conn, cfg)
 					// Do the TLS handshake using TLSConfig over the wrapped connection.
 					err = doHandshake(ctx, tlsConn, cfg)
+					tlsProxy = true
 					return tlsConn, err
 				}
 			}
@@ -341,9 +343,9 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		}
 	}()
 
-	if u.Scheme == "https" && d.NetDialTLSContext == nil {
+	if u.Scheme == "https" && d.NetDialTLSContext == nil && !tlsProxy {
 		// If NetDialTLSContext is set, assume that the TLS handshake has already been done
-
+		// The TLS Handshake could have also occurred in the HTTPS Proxy dialing.
 		cfg := cloneTLSConfig(d.TLSClientConfig)
 		if cfg.ServerName == "" {
 			cfg.ServerName = hostNoPort
