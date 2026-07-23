@@ -24,16 +24,13 @@ import (
 	"sync"
 	"time"
 
-	restful "github.com/emicklei/go-restful/v3"
-
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/routes"
 	"k8s.io/klog/v2"
 	v1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"k8s.io/kube-openapi/pkg/aggregator"
-	"k8s.io/kube-openapi/pkg/builder"
 	"k8s.io/kube-openapi/pkg/cached"
 	"k8s.io/kube-openapi/pkg/common"
-	"k8s.io/kube-openapi/pkg/common/restfuladapter"
 	"k8s.io/kube-openapi/pkg/handler"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
@@ -85,12 +82,18 @@ type specAggregator struct {
 	downloader *Downloader
 }
 
-func buildAndRegisterSpecAggregatorForLocalServices(downloader *Downloader, aggregatorSpec *spec.Swagger, delegationHandlers []http.Handler, pathHandler common.PathHandler) *specAggregator {
+func buildAndRegisterSpecAggregatorForLocalServices(downloader *Downloader, staticSpecGetter func() *spec.Swagger, delegationHandlers []http.Handler, pathHandler common.PathHandler) *specAggregator {
 	s := &specAggregator{
 		downloader:            downloader,
 		specsByAPIServiceName: map[string]*openAPISpecInfo{},
 	}
-	cachedAggregatorSpec := cached.Static(aggregatorSpec, "never-changes")
+	cachedAggregatorSpec := cached.Func(func() (*spec.Swagger, string, error) {
+		coreSpec := staticSpecGetter()
+		if coreSpec == nil {
+			return &spec.Swagger{}, "empty", nil
+		}
+		return coreSpec, fmt.Sprintf("%d", time.Now().UnixNano()), nil
+	})
 	s.addLocalSpec(fmt.Sprintf(localDelegateChainNamePattern, 0), cachedAggregatorSpec)
 	for i, handler := range delegationHandlers {
 		name := fmt.Sprintf(localDelegateChainNamePattern, i+1)
@@ -99,20 +102,20 @@ func buildAndRegisterSpecAggregatorForLocalServices(downloader *Downloader, aggr
 		s.addLocalSpec(name, spec)
 	}
 
-	s.openAPIVersionedService = handler.NewOpenAPIServiceLazy(s.buildMergeSpecLocked())
+	mergedCache := s.buildMergeSpecLocked()
+
+	cache := routes.NewTTLCache(routes.V2CacheTTL, func() (*spec.Swagger, string, error) {
+		return mergedCache.Get()
+	})
+
+	s.openAPIVersionedService = handler.NewOpenAPIServiceLazy(cache)
 	s.openAPIVersionedService.RegisterOpenAPIVersionedService("/openapi/v2", pathHandler)
+
 	return s
 }
 
 // BuildAndRegisterAggregator registered OpenAPI aggregator handler. This function is not thread safe as it only being called on startup.
-func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.DelegationTarget, webServices []*restful.WebService,
-	config *common.Config, pathHandler common.PathHandler) (SpecAggregator, error) {
-
-	aggregatorOpenAPISpec, err := builder.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(webServices), config)
-	if err != nil {
-		return nil, err
-	}
-	aggregatorOpenAPISpec.Definitions = handler.PruneDefaults(aggregatorOpenAPISpec.Definitions)
+func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.DelegationTarget, staticSpecGetter func() *spec.Swagger, pathHandler common.PathHandler) (SpecAggregator, error) {
 
 	var delegationHandlers []http.Handler
 
@@ -129,7 +132,7 @@ func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.
 		}
 		delegationHandlers = append(delegationHandlers, handler)
 	}
-	s := buildAndRegisterSpecAggregatorForLocalServices(downloader, aggregatorOpenAPISpec, delegationHandlers, pathHandler)
+	s := buildAndRegisterSpecAggregatorForLocalServices(downloader, staticSpecGetter, delegationHandlers, pathHandler)
 	return s, nil
 }
 

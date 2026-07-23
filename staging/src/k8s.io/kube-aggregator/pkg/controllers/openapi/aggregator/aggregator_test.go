@@ -626,7 +626,7 @@ func buildAndRegisterSpecAggregator(delegationHandlers []http.Handler, mux commo
 			},
 		},
 	}
-	s := buildAndRegisterSpecAggregatorForLocalServices(&downloader, aggregatorSpec, delegationHandlers, mux)
+	s := buildAndRegisterSpecAggregatorForLocalServices(&downloader, func() *spec.Swagger { return aggregatorSpec }, delegationHandlers, mux)
 	return s
 }
 

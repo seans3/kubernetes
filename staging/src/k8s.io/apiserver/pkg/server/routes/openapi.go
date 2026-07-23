@@ -18,6 +18,7 @@ package routes
 
 import (
 	"strings"
+	"time"
 
 	restful "github.com/emicklei/go-restful/v3"
 	"k8s.io/klog/v2"
@@ -39,17 +40,33 @@ type OpenAPI struct {
 	V3Config *common.OpenAPIV3Config
 }
 
+const V2CacheTTL = 10 * time.Minute
+
 // Install adds the SwaggerUI webservice to the given mux.
-func (oa OpenAPI) InstallV2(c *restful.Container, mux *mux.PathRecorderMux) (*handler.OpenAPIService, *spec.Swagger) {
-	spec, err := builder2.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(c.RegisteredWebServices()), oa.Config)
-	if err != nil {
-		klog.Fatalf("Failed to build open api spec for root: %v", err)
-	}
-	spec.Definitions = handler.PruneDefaults(spec.Definitions)
-	openAPIVersionedService := handler.NewOpenAPIService(spec)
+func (oa OpenAPI) InstallV2(c *restful.Container, mux *mux.PathRecorderMux) (*handler.OpenAPIService, func() *spec.Swagger) {
+	cache := NewTTLCache(V2CacheTTL, func() (*spec.Swagger, string, error) {
+		spec, err := builder2.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(c.RegisteredWebServices()), oa.Config)
+		if err != nil {
+			klog.Errorf("Failed to build open api spec for root: %v", err)
+			return nil, "", err
+		}
+		spec.Definitions = handler.PruneDefaults(spec.Definitions)
+		// We don't generate an etag here because handler.OpenAPIService generates its own
+		// etag based on the marshaled JSON.
+		return spec, "", nil
+	})
+
+	// Create the OpenAPIService backed by the TTL cache.
+	openAPIVersionedService := handler.NewOpenAPIServiceLazy(cache)
 	openAPIVersionedService.RegisterOpenAPIVersionedService("/openapi/v2", mux)
 
-	return openAPIVersionedService, spec
+	// Return a simplified getter for other components (like CRD controller)
+	getter := func() *spec.Swagger {
+		s, _, _ := cache.Get()
+		return s
+	}
+
+	return openAPIVersionedService, getter
 }
 
 // InstallV3 adds the static group/versions defined in the RegisteredWebServices to the OpenAPI v3 spec.

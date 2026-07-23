@@ -341,14 +341,16 @@ func setup(t *testing.T) (*testEnv, context.Context) {
 	stopCh := make(chan struct{})
 
 	env.runFunc = func() {
-		go c.Run(&spec.Swagger{
-			SwaggerProps: spec.SwaggerProps{
-				Paths: &spec.Paths{
-					Paths: map[string]spec.PathItem{
-						"/apis/apiextensions.k8s.io/v1": {},
+		go c.Run(func() *spec.Swagger {
+			return &spec.Swagger{
+				SwaggerProps: spec.SwaggerProps{
+					Paths: &spec.Paths{
+						Paths: map[string]spec.PathItem{
+							"/apis/apiextensions.k8s.io/v1": {},
+						},
 					},
 				},
-			},
+			}
 		}, h, stopCh)
 	}
 

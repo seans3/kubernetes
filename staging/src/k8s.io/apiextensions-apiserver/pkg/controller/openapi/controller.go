@@ -53,7 +53,7 @@ type Controller struct {
 
 	queue workqueue.TypedRateLimitingInterface[string]
 
-	staticSpec *spec.Swagger
+	staticSpecGetter func() *spec.Swagger
 
 	openAPIService *handler.OpenAPIService
 
@@ -134,14 +134,14 @@ func NewController(crdInformer informers.CustomResourceDefinitionInformer) *Cont
 }
 
 // Run sets openAPIAggregationManager and starts workers
-func (c *Controller) Run(staticSpec *spec.Swagger, openAPIService *handler.OpenAPIService, stopCh <-chan struct{}) {
+func (c *Controller) Run(staticSpecGetter func() *spec.Swagger, openAPIService *handler.OpenAPIService, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 	defer klog.Infof("Shutting down OpenAPI controller")
 
 	klog.Infof("Starting OpenAPI controller")
 
-	c.staticSpec = staticSpec
+	c.staticSpecGetter = staticSpecGetter
 	c.openAPIService = openAPIService
 
 	if !cache.WaitForCacheSync(stopCh, c.crdsSynced) {
@@ -254,7 +254,11 @@ func (c *Controller) updateSpecLocked() {
 				localCRDSpec = append(localCRDSpec, results[k].Value)
 			}
 		}
-		mergedSpec, err := builder.MergeSpecs(c.staticSpec, localCRDSpec...)
+		coreSpec := c.staticSpecGetter()
+		if coreSpec == nil {
+			coreSpec = &spec.Swagger{}
+		}
+		mergedSpec, err := builder.MergeSpecs(coreSpec, localCRDSpec...)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to merge specs: %v", err)
 		}

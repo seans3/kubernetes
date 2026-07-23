@@ -185,9 +185,9 @@ type GenericAPIServer struct {
 	// It is set during PrepareRun if `openAPIConfig` is non-nil unless `skipOpenAPIInstallation` is true.
 	OpenAPIV3VersionedService *handler3.OpenAPIService
 
-	// StaticOpenAPISpec is the spec derived from the restful container endpoints.
+	// StaticOpenAPISpecGetter is a function that lazily builds and returns the spec derived from the restful container endpoints.
 	// It is set during PrepareRun.
-	StaticOpenAPISpec *spec.Swagger
+	StaticOpenAPISpecGetter func() *spec.Swagger
 
 	// PostStartHooks are each called after the server has started listening, in a separate go func for each
 	// with no guarantee of ordering between them.  The map key is a name used for error reporting.
@@ -445,9 +445,9 @@ func (s *GenericAPIServer) PrepareRun() preparedGenericAPIServer {
 	s.delegationTarget.PrepareRun()
 
 	if s.openAPIConfig != nil && !s.skipOpenAPIInstallation {
-		s.OpenAPIVersionedService, s.StaticOpenAPISpec = routes.OpenAPI{
-			Config: s.openAPIConfig,
-		}.InstallV2(s.Handler.GoRestfulContainer, s.Handler.NonGoRestfulMux)
+	        s.OpenAPIVersionedService, s.StaticOpenAPISpecGetter = routes.OpenAPI{
+	                Config: s.openAPIConfig,
+	        }.InstallV2(s.Handler.GoRestfulContainer, s.Handler.NonGoRestfulMux)
 	}
 
 	if s.openAPIV3Config != nil && !s.skipOpenAPIInstallation {
@@ -1058,11 +1058,9 @@ func (s *GenericAPIServer) getOpenAPIModels(apiPrefix string, apiGroupInfos ...*
 	// Build the openapi definitions for those resources and convert it to proto models
 	openAPISpec, err := openapibuilder3.BuildOpenAPIDefinitionsForResources(s.openAPIV3Config, resourceNames...)
 	if err != nil {
-		return nil, err
+	        return nil, err
 	}
-	for _, apiGroupInfo := range apiGroupInfos {
-		apiGroupInfo.StaticOpenAPISpec = openAPISpec
-	}
+	// StaticOpenAPISpec assignment removed as part of Lazy-Loaded V2 Cache refactor.
 
 	typeConverter, err := managedfields.NewTypeConverter(openAPISpec, false)
 	if err != nil {

@@ -364,7 +364,7 @@ func TestUpdateOpenAPISpec(t *testing.T) {
 	defer server.Close()
 
 	// verify the static spec in record is what we currently serve
-	oldSpec, err := json.Marshal(s.StaticOpenAPISpec)
+	oldSpec, err := json.Marshal(s.StaticOpenAPISpecGetter())
 	assert.NoError(err)
 
 	resp, err := http.Get(server.URL + "/openapi/v2")
