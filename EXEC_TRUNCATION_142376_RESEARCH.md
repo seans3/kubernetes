@@ -21,6 +21,10 @@ Line numbers below refer to that commit.
   SPDY it is silent (exit 0, empty stderr).
 - PR [#142461](https://github.com/kubernetes/kubernetes/pull/142461) fixes the
   translator hop in the isolated test. It is open and under discussion.
+- The translator fix must not land alone. In front of an unfixed runtime it
+  turns today's loud WebSocket failure into silent success, unless the
+  client-go "empty status is an error" change is in the same binary. See
+  "Version skew" below.
 
 ## The reported issue
 
@@ -226,7 +230,9 @@ REPRO_PAYLOAD=8388608 REPRO_RATE=131072 REPRO_RUNS=3 \
 ```
 
 `REPRO_PAYLOAD` is bytes written by the upstream, `REPRO_RATE` is the reader's
-bytes per second, `REPRO_RUNS` is the number of slow runs. Each invocation also
+bytes per second, `REPRO_RUNS` is the number of slow runs. `REPRO_UPSTREAM=closefirst`
+makes the upstream write the status and close at once, as an unfixed runtime
+does (used for the skew tests below; the default is the well-behaved upstream). Each invocation also
 does one unthrottled control run first. The test only logs results; it does not
 fail on truncation.
 
@@ -266,13 +272,85 @@ issue.
 With PR #142461 the handler returned at 64.1s and the client at 64.3s: the
 server now waits for the client instead of closing first.
 
+## Version skew
+
+The first version of this report said skew for the translator change was benign
+and recommended landing it by itself. That was wrong in one case, found by
+thc1006 in review of #142461 and confirmed here.
+
+### The mixed-version case
+
+With a fixed translator in front of an unfixed streaming server, a WebSocket
+exec that loses its tail exits 0 instead of failing:
+
+1. The old runtime still closes first, so the SPDY leg into the translator is
+   cut short with no status.
+2. The translator's own client-go SPDY executor treats the missing status as
+   success (loss point 2).
+3. The translator writes an explicit `Success` to the WebSocket client
+   (`streamtranslator.go:148`).
+4. With the fix, that `Success` is delivered cleanly instead of being destroyed
+   by a reset.
+
+thc1006 reproduced this in 5 of 5 runs with the PR's own tests. semx's cluster
+table shows the same, and notes it already happens occasionally today behind an
+old translator (2 of 5 runs with 100 ms delay).
+
+### Results here
+
+Same harness, 8 MiB at 128 KiB/s, 3 slow runs per cell, loopback. "New" is PR
+#142461 at `fce8f6619ea`; "old" is its merge base `6c1c7702cf2`. The translator
+files are `apiserver/pkg/util/proxy` and `wsstream`; the client-go files are
+`tools/remotecommand/errorstream.go` and `v4.go`. Each test binary has one copy
+of client-go, shared by the translator's upstream SPDY executor and the
+WebSocket client. The copy inside the translator's binary is what decides the
+outcome in the "closes first" rows.
+
+| Translator | client-go | Upstream | Result |
+|---|---|---|---|
+| new | old | well behaved | complete 3/3 |
+| new | new | well behaved | complete 3/3 |
+| new | old | closes first | **truncated 3/3 (53–76% received), no error** |
+| new | new | closes first | truncated 3/3 (56–62%), error: `connection closed before the command's status was received; the output may be incomplete` |
+| old | old | well behaved | truncated 3/3 (72%), `connection reset by peer` |
+| old | new | well behaved | truncated 3/3 (72%), `connection reset by peer` |
+| old | old | closes first | truncated 3/3 (40%), `connection reset by peer` |
+| old | new | closes first | truncated 3/3 (40%), `connection reset by peer` |
+
+The unthrottled control run was complete in every configuration.
+
+### What holds and what does not
+
+- **Old clients work with the new server.** An old client-go WebSocket client
+  against the new translator received everything. The PR does not change the
+  client's WebSocket wire code. semx also reports complete output for kubectl
+  1.30 through 1.37.1 and the Python, Node, Rust and Java clients; that was not
+  verified here.
+- **A new client against an old server behaves as today**: the same loud reset.
+- **The translator change is not safe to land alone.** Row three is a
+  regression from loud to silent. The client-go change has to be in the same
+  apiserver or kubelet binary as the translator change.
+- **Updating kubectl alone does not help WebSocket.** The translator sends an
+  explicit `Success`, so the client has nothing to detect.
+
+Caveats reported in the PR thread, not verified here:
+
+- fabric8 (Java) with stdin open still loses the tail against the fixed server,
+  through its own handling after the close.
+- A client that never answers the close frame is held for the full 15 minutes.
+- The new client-go error is a behaviour change: if an old server loses only
+  the status frame after the last byte, the old client reports success and the
+  new one reports an error.
+- v1 to v3 servers write nothing on success, so the empty-status check has to
+  stay specific to v4 and v5 (the PR does this).
+
 ## Wider findings in the KEP-4006 code
 
 - **The translator can turn upstream truncation into explicit success.** It
   uses the client-go SPDY executor toward the runtime. If the runtime cuts the
   SPDY leg short, `StreamWithContext` returns nil (loss point 2) and
   `streamtranslator.go:148` writes a `Success` status to the WebSocket client.
-  This is read from the code and was not tested.
+  Confirmed by the skew tests above.
 - **The KEP does not specify server-side termination.** `v5.channel.k8s.io`
   adds only the client-to-server `CLOSE` signal, for stdin half-close. Nothing
   says how the server ends a session so that buffered output is delivered. The
@@ -305,22 +383,32 @@ server now waits for the client instead of closing first.
 - **semx's response:** agreed to write the KEP. Measurements in the thread show
   500 ms cuts even a fast LAN client and 30 s cuts a 256 KiB/s reader, and that
   a client can already hold a session for 4h today.
+- **Review of #142461:** thc1006 found the mixed-version case described under
+  "Version skew". liggitt is assigned and noted the change is large and spans
+  many layers. aojea commented inline that 15 minutes is excessive and a
+  denial-of-service vector, pointing at the 0.5s grace containerd and socat use.
+  semx offered to split the PR in three: client-go first, then the additive
+  `wsstream` methods, then the server and translator.
 - **Backport plan in the thread:** cherry-picks to 1.37 and 1.36, manual
   backport to 1.35, then dependency bumps or ports in containerd and CRI-O.
 
 ## Recommendation
 
-Split the translator and `wsstream` change out of #142461 and land it under
-KEP-4006.
+Review the translator and `wsstream` change together with the client-go "empty
+v4/v5 status is an error" change under KEP-4006, separately from the
+cri-streaming change.
 
-- It is not a wire-protocol change. The server completes the standard WebSocket
-  closing handshake instead of closing the socket first, and existing clients
-  already echo the close frame.
-- Version skew is benign: a new server works with old clients, and an old server
-  with a new client behaves as today.
-- The cri-streaming change and the client-go "empty status is an error" change
-  carry the real skew and rollout questions. They can follow the KEP path aojea
-  asked for.
+- **Ordering matters.** The client-go change must land before, or with, the
+  translator change, and be in the same apiserver or kubelet binary. This
+  matches the order semx offered for a split.
+- **On the WebSocket leg it is not a wire-protocol change.** The server
+  completes the standard WebSocket closing handshake instead of closing the
+  socket first, and existing clients already echo the close frame.
+- **The cri-streaming change** carries the real cross-component rollout
+  questions (runtimes vendor it) and can follow the KEP path aojea asked for.
+
+An earlier version of this report recommended landing the translator change by
+itself. That is withdrawn; see "Version skew".
 
 ## Open questions
 
@@ -340,13 +428,19 @@ Verified by running code here:
 - The translator hop alone truncates a slow WebSocket client on master.
 - PR #142461 removes that truncation in the same harness.
 - A fast reader is unaffected.
+- A fixed translator built with old client-go, in front of an upstream that
+  closes first, truncates with no error.
+- The same with new client-go reports an error.
+- An old client-go WebSocket client receives everything from the fixed
+  translator.
 
-Read from code, not tested here:
+Read from code or reported by others, not tested here:
 
 - The CRI streaming server and client-go loss points (independently reproduced
   by others in the issue thread).
-- The translator reporting success after upstream truncation.
 - The write-deadline override (PR #142596 has its own test).
+- Results for released kubectl binaries and non-Go clients against the fix
+  (semx's cluster runs).
 
 Inferred:
 
@@ -361,6 +455,7 @@ Inferred:
 - `EXEC_TRUNCATION_142376_INPUTS/`: sources as fetched on 2026-10-05.
   - `issue-142376-body.txt`, `issue-142376-comments.txt`
   - `pr-142461-description.txt`, `pr-142461.diff`
+  - `pr-142461-comments-and-reviews.txt`
   - `pr-142596-description.txt`, `pr-142596.diff`
   - `containerd-issue-14275.txt`
   - `kep-4006-README.md`, `kep-4006-kep.yaml`

@@ -22,6 +22,9 @@ package proxy
 // when the WebSocket client reads slowly? The upstream SPDY server here is
 // deliberately well behaved (half-closes its streams and waits for the
 // translator to close), so any loss is attributable to the translator hop.
+// With REPRO_UPSTREAM=closefirst the upstream instead writes the status and
+// closes at once, as an unfixed CRI streaming server does, to exercise the
+// mixed-version case (fixed translator in front of an old runtime).
 // Delete after use.
 
 import (
@@ -105,6 +108,11 @@ func runIssue142376(t *testing.T, payloadSize int, readerBytesPerSec int64) (int
 		}
 		// Well-behaved upstream: half-close (FIN) every stream, then wait for the
 		// SPDY client (the translator) to close the connection.
+		if os.Getenv("REPRO_UPSTREAM") == "closefirst" {
+			// Old cri-streaming behaviour: status, then close at once (deferred conn.Close).
+			upstreamSawClientClose <- true
+			return
+		}
 		_ = stdoutStream.Close()
 		_ = errorStream.Close()
 		select {

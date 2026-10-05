@@ -1,0 +1,240 @@
+---- ISSUE-COMMENT kubernetes-prow[bot] 2026-09-27T21:50:37Z id=5860142935
+This issue is currently awaiting triage.
+
+If a SIG or subproject determines this is a relevant issue, they will accept it by applying the `triage/accepted` label and provide further guidance.
+
+The `triage/accepted` label can be added by org members by writing `/triage accepted` in a comment.
+
+
+<details>
+
+Instructions for interacting with me using PR comments are available [here](https://git.k8s.io/community/contributors/guide/pull-requests.md).  If you have questions or suggestions related to my behavior, please file an issue against the [kubernetes-sigs/prow](https://github.com/kubernetes-sigs/prow/issues/new?title=Prow%20issue:) repository.
+</details>
+
+---- ISSUE-COMMENT kubernetes-prow[bot] 2026-09-27T21:50:38Z id=5860143065
+Hi @semx. Thanks for your PR.
+
+I'm waiting for a [kubernetes](https://github.com/orgs/kubernetes/people) member to verify that this patch is reasonable to test. If it is, they should reply with `/ok-to-test` on its own line. Until that is done, I will not automatically test new commits in this PR, but the usual testing commands by org members will still work.
+
+>[!TIP]
+>**We noticed you've done this a few times! Consider [joining the org](https://git.k8s.io/community/community-membership.md#member) to skip this step and gain `/lgtm` and other bot rights.** We recommend asking approvers on your previous PRs to sponsor you.
+
+Once the patch is verified, the new status will be reflected by the `ok-to-test` label.
+
+I understand the commands that are listed [here](https://go.k8s.io/bot-commands?repo=kubernetes%2Fkubernetes).
+
+<details>
+
+Instructions for interacting with me using PR comments are available [here](https://git.k8s.io/community/contributors/guide/pull-requests.md).  If you have questions or suggestions related to my behavior, please file an issue against the [kubernetes-sigs/prow](https://github.com/kubernetes-sigs/prow/issues/new?title=Prow%20issue:) repository.
+</details>
+
+
+---- ISSUE-COMMENT semx 2026-09-27T21:50:49Z id=5860144356
+/sig node
+/sig api-machinery
+/sig cli
+
+---- ISSUE-COMMENT semx 2026-09-28T08:16:23Z id=5866121361
+Revision 0cf6c397:
+
+- client-go (v4 and v5) treats an error stream that ends without a status as an error, `connection closed before the command's status was received; the output may be incomplete`, so a server that still closes first is reported through the translator and directly over SPDY instead of exiting 0. New `TestExecWithoutStatusIsAnError` in `pkg/client/tests`, red without the change; the mixed configuration is a row in the table now.
+- `finish` sets a write deadline of `finishTimeout` on the connection before the status, stream close and close frames, so those writes and the frames the connection close sends afterwards are bounded for a peer that has stopped reading; the comment says what is bounded by what.
+- `wsExecSession` closes the connection before waiting for its writers. `TestServeExecFinishTimeoutBoundsWaitForClient` now runs with an idle timeout shorter than `finishTimeout`, so the pings are what keeps the handler alive until the bound; `TestEmptyErrorStream` in client-go pins the empty error stream contract for v2, v3, v4.
+- `CloseWrite` sends the close frame through a `websocket.Codec`; the unused dialer in the WebSocket test case is gone; the idle-timeout sentences and the description (where the translator runs, what containerd and CRI-O vendor, 1.35 cherry-pick path, release note) are updated; linter hints addressed.
+
+
+---- ISSUE-COMMENT semx 2026-09-28T10:35:29Z id=5868220063
+/assign @liggitt
+/cc @seans3
+
+
+---- ISSUE-COMMENT liggitt 2026-09-29T18:14:16Z id=5895976147
+cc @aojea for visibility
+
+this change is pretty large and touches a lot of layers, it'll take me a while to get time to go through it and understand the issue and the proposed fix
+
+---- ISSUE-COMMENT semx 2026-09-29T19:43:18Z id=5897387662
+Thanks, understood. A map to make the size less daunting:
+
+- The production change is ~290 lines across five modules; the remaining ~1,100 are tests. Every path in the table in the description was reproduced on the old code and verified on the fix, 5 of 5 runs each, over SPDY and WebSocket, directly against `ServeExec` and through the real apiserver and kubelet proxies and the stream translator with the client-go executors. That includes the mixed-version case of a fixed translator in front of a runtime that has not been updated yet.
+- Reading order: `finish` in `cri-streaming/pkg/streaming/remotecommand/httpstream.go` (the fix), `CloseWrite`/`CloseChan` in `streaming/pkg/httpstream/wsstream/conn.go`, the translator in `apiserver/pkg/util/proxy`, then the client-go empty-status check in `tools/remotecommand`.
+- It can land in three independent PRs if that is easier: client-go first (an empty status stream becomes an error, which alone turns silent truncation into a visible failure against any server), then the additive wsstream methods, then the server and translator.
+
+@aojea the translator and wsstream parts are the ones closest to your streaming work.
+
+
+---- ISSUE-COMMENT semx 2026-09-30T21:44:35Z id=5920263856
+Short version: on a real multi-node cluster, the old code cut off the end of `kubectl exec` output in every run where a slow client was also sending input (over SPDY with exit 0); with this PR the output was complete in every run, on containerd, CRI-O and Windows, with no leaks over a 12 h soak. Updating the runtime is what fixes SPDY; until then the client-go change turns the silent loss into an error.
+
+<details>
+<summary>Details and numbers</summary>
+
+Results from real clusters, to back the unit tests with the full stack. Everything below compares the merge base (`6c1c7702cf2`) with this PR's head (`0cf6c397517`) under identical conditions, and every number was recounted from the raw per-run data.
+
+**Setup.** kubeadm cluster on separate machines: control plane and workers on Proxmox VMs plus two bare-metal workers, Ubuntu 24.04 (kernel 6.8), Debian 12 (6.1), Ubuntu 26.04 (7.0), and a Windows Server 2022 node. kube-apiserver and kubelet built from both commits; runtimes built with `k8s.io/cri-streaming` and `k8s.io/streaming` from both commits: containerd main, CRI-O main, containerd release/2.2 with the port of this change, and containerd main for Windows. The client reads a 16 MiB output at 16 MiB/s and writes one byte of stdin every 5 ms, the pattern from #142376; 5 runs per cell unless noted.
+
+**1. The bug and the fix, end to end**
+
+| runtime / node | merge base, WebSocket | merge base, SPDY | this PR |
+|---|---|---|---|
+| containerd main, kernels 6.1 / 6.8 / 7.0 | 0/30 complete, exit 1 | 0/30 complete, **exit 0** with a pre-fix kubectl | 40/40 complete |
+| containerd release/2.2 + port, bare metal | 0/5, exit 1 | 0/5, exit 0 | 20/20 |
+| CRI-O main | 0/5, exit 1 | 0/5, exit 0 | 30/30 |
+| Windows Server 2022, containerd | 0/5, exit 1 | 0/5, exit 0 | 20/20 |
+
+No netem or buffer tuning was needed on the LAN. With netem on the worker (delay 20 ms and 100 ms, loss 0.5 % and 2 %, 10 Mbit/s, 100 ms + 1 %), the merge base completed 0/120 and this PR 120/120.
+
+**2. Upgrade order (mixed versions)**
+
+| apiserver / kubelet / runtime | kubectl 1.37.1, WS | kubectl 1.37.1, SPDY | kubectl from this PR, WS / SPDY |
+|---|---|---|---|
+| new / new / old | error 4/5, complete 1/5 | **0/5, exit 0** | error / error |
+| old / old / new | error (old translator in kubelet) | 5/5 | error / 5/5 |
+| old / new / new | 5/5 | 5/5 | 5/5 / 5/5 |
+| new / old / new | error | 5/5 | error / 5/5 |
+
+So the runtime update is what makes SPDY complete; until the runtime is updated, only the client-go change turns a silent truncation into an error. One more limit, found with 100 ms delay: behind an old translator, kubectl can still exit 0 over WebSocket, the new one as well as 1.37.1 (2/5 each), because the old translator's own client-go turns the runtime's missing status into a `Success` status (`streamtranslator.go`, "Write the success status back to the WebSocket client"). Updating kubectl alone does not cover WebSocket; the fixed translator does.
+
+**3. Clients and how long the server holds a session**
+
+Against this PR, 16 MiB complete 5/5 for: kubectl v1.30.14, v1.32.13, v1.34.12, v1.36.5, v1.37.1 (SPDY and WebSocket); client-go v0.30.14, v0.32.13, v0.34.12, v0.36.5, v0.37.1 and this PR (SPDY, WebSocket, fallback executors); Python `kubernetes` 36.0.3; `@kubernetes/client-node` 2.0.0; Rust `kube` 4.2.0; Java `client-java` 24.0.0; crictl. Against the merge base every SDK client above and crictl lose data, and every client-go ≤ v0.37 over SPDY does it with exit 0.
+
+Time from the command's exit until the session is gone on apiserver, kubelet and runtime (`echo hi`, 20 runs, measured on the nodes): medians 26 to 58 ms on both commits for every kubectl, client-go, Python, Node, Rust and crictl. Two clients differ:
+- `client-java` 24.0.0 answers the server's close frame 58 ms after it (client-go: 0.5 ms), so its session now ends 54 ms later on the kubelet leg and 58 ms later on the apiserver leg; the merge base did not wait.
+- fabric8 7.3.1 loses the tail while it keeps writing stdin: in the soak 289 of 357 long runs lost bytes, and of the 68 that received the whole stream only 3 exited without an `IOException`; with stdin off it completes 5/5. A packet capture shows this PR delivering the whole stream followed by FIN in every run; fabric8 then drops its own buffered tail when a stdin write fails after the close. The merge base sent 6 to 12 MB and then RST.
+- A WebSocket client that never answers the close frame is held 900.1 s, the 15-minute bound in the description, then closed by the server.
+
+**4. Failures, load and duration (this PR)**
+
+- Client SIGKILL mid-stream: session released in 0.2 s; container killed: 0.4 s; pod deleted: 2.3 s; 60 s network cut: 44 s after the link returned (TCP timeouts).
+- 2,000 sequential + 200 concurrent execs: 0 errors, p50/p95/p99 73/80/84 ms on the merge base and 73/81/84 ms with this PR; goroutines and FDs of apiserver, kubelet and containerd back to baseline.
+- 12 h soak, all SDK clients mixed, up to 30 execs/min: 14,272 sessions; short commands 11,417/11,417; long commands complete except fabric8 (above) and one client-java run with 0 bytes and no error recorded, the first run after the load generator stalled for 17 minutes (50 reruns: 50/50); goroutines (apiserver 2,781 → 2,780, kubelet 221, containerd 109), FDs (110 / 25 / 76) and RSS flat from the first hour to the last.
+- TTY, exit code 3, stdin EOF, attach, port-forward of 100 MiB and `kubectl cp` both ways: identical on both commits. e2e focus on exec/attach/port-forward/cp and `Kubectl client`: 50/51; the one failure copied the macOS kubectl into a Linux pod (a harness artifact) and passed when rerun on the control plane with Linux binaries.
+
+Not covered: clients beyond the ones listed, and Windows beyond one node with a HostProcess pod. Scripts and raw data are available if you want to rerun any cell.
+
+</details>
+
+
+---- ISSUE-COMMENT liggitt 2026-09-30T21:50:43Z id=5920345383
+Just so you're aware, lots of large AI-generated comments take a _lot_ of time to digest and make it really hard for me to get at the substance of what you're saying. Unfortunately, that tends to bump PRs that use those down in my priority stack significantly. Can you distill the comments / updates back into a more compact description?
+
+---- ISSUE-COMMENT semx 2026-09-30T21:59:44Z id=5920461286
+Done. In plain terms: when a command writes more than the client has read so far and the client is still sending something (a keystroke, a ping), the server closes right after the exit status, the kernel resets the connection and the rest of the output is thrown away. Over SPDY kubectl then even reports success. This PR makes the server wait for the client to close instead, and makes client-go treat a missing status as an error.
+
+The description is now one screen with that and the one behaviour change; the numbers in my last comment are folded behind a two-line summary. The change itself is about 290 lines outside the tests, and the description lists the order to read it in.
+
+
+---- ISSUE-COMMENT aojea 2026-10-01T10:45:06Z id=5929757251
+Commented in https://github.com/kubernetes/kubernetes/issues/142376#issuecomment-5929718289
+
+---- ISSUE-COMMENT kubernetes-prow[bot] 2026-10-01T14:23:00Z id=5933438547
+[APPROVALNOTIFIER] This PR is **NOT APPROVED**
+
+This pull-request has been approved by: *<a href="https://github.com/kubernetes/kubernetes/pull/142461#" title="Author self-approved">semx</a>*
+**Once this PR has been reviewed and has the lgtm label**, please ask for approval from [liggitt](https://github.com/liggitt). For more information see [the Code Review Process](https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process).
+
+The full list of commands accepted by this bot can be found [here](https://go.k8s.io/bot-commands?repo=kubernetes%2Fkubernetes).
+
+<details open>
+Needs approval from an approver in each of these files:
+
+- **[pkg/client/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/pkg/client/OWNERS)**
+- **[staging/src/k8s.io/apiserver/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/OWNERS)**
+- **[staging/src/k8s.io/client-go/tools/remotecommand/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/client-go/tools/remotecommand/OWNERS)**
+- **[staging/src/k8s.io/cri-streaming/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/cri-streaming/OWNERS)**
+- **[staging/src/k8s.io/streaming/OWNERS](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/streaming/OWNERS)**
+
+Approvers can indicate their approval by writing `/approve` in a comment
+Approvers can cancel approval by writing `/approve cancel` in a comment
+</details>
+<!-- META={"approvers":["liggitt"]} -->
+
+---- REVIEW thc1006 2026-09-28T06:57:24Z state=COMMENTED
+TL;DR: the fix works in my runs. One problem: if the translator has this change but the streaming server behind it does not, a WebSocket exec that loses its tail now exits 0 instead of failing.
+
+Thanks for working on this, and for tests that show the failure so clearly. Against the old production code the new tests fail the way your table says, and on this head they pass with `-count=3`, and again with `-race`.
+
+To check the mixed case, I kept the new `apiserver/pkg/util/proxy` files and `wsstream/conn.go` and put back the old cri-streaming files. The websocket case of `TestExecSlowClientThroughAPIServerAndKubelet` then lost the tail in 5 of 5 runs, and `StreamWithContext` returned nil each time. With all of the old code it failed with close 1006. The old server still drops the tail, and the translator's SPDY executor returns nil for the same reason you describe for SPDY clients. The translator then reports success and, with this change, closes cleanly. Clusters will run like this until containerd and CRI-O ship the change, so the client-go hardening you mention for empty error streams may need to land first, or together with this one.
+
+Two things in the description:
+
+- Nodes that declare `ExtendWebSocketsToKubelet` (beta, on by default since 1.36) get WebSocket exec translated by the kubelet (`pkg/kubelet/server/server.go`), and the apiserver only proxies it. On the v1.37 cluster behind my numbers in #142376 every node declares it and the apiserver has `ExtendWebSocketsToKubelet` and `TranslateStreamCloseWebsocketRequests` at their defaults, so those WebSocket runs went through the kubelet's translator. On 1.36+ nodes the translator part of this fix comes with the kubelet upgrade. The release note could say that.
+- containerd 2.3 also vendors `k8s.io/cri-streaming`. containerd 2.0 and CRI-O 1.34 and 1.35 use `k8s.io/kubelet/pkg/cri/streaming`, which is also where the server lives on release-1.35, so a 1.35 cherry-pick would change that package.
+
+<details>
+<summary>Test output, websocket case, first run of each (only the test's own lines)</summary>
+
+New translator, old cri-streaming:
+
+```
+    exec_slow_client_test.go:181: received 13762560 of 16777216 bytes in 1.831s, err <nil>
+    exec_slow_client_test.go:186: stdout truncated: got 13762560 bytes, want 16777216 (lost 3014656)
+```
+
+All old code:
+
+```
+    exec_slow_client_test.go:181: received 1675014 of 16777216 bytes in 230ms, err error reading from error stream: read message: websocket: close 1006 (abnormal closure): unexpected EOF
+    exec_slow_client_test.go:183: exec failed: error reading from error stream: read message: websocket: close 1006 (abnormal closure): unexpected EOF
+    exec_slow_client_test.go:186: stdout truncated: got 1675014 bytes, want 16777216 (lost 15102202)
+```
+
+For the old code I used the seven production files from the parent commit, with a test-only `var finishTimeout` so the new tests compile.
+</details>
+
+/ok-to-test
+
+
+---- REVIEW thc1006 2026-09-28T07:52:06Z state=COMMENTED
+Two more notes from the finish path are inline. On the empty error stream: `watchErrorStream` returns nil before the decoder ever runs, so the hardening can't live in `errorDecoderV4.decode` alone. It also has to stay per protocol, since the v1 to v3 servers write nothing on success (`v1WriteStatusFunc`) and only v4 always writes a status.
+
+---- INLINE thc1006 2026-09-28T06:57:24Z staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn.go:361
+`Codec.Send` takes the write lock and uses the frame type that `Marshal` returns, so this could leave `PayloadType` alone:
+
+```go
+var closeFrameCodec = websocket.Codec{Marshal: func(v interface{}) ([]byte, byte, error) {
+	return v.([]byte), websocket.CloseFrame, nil
+}}
+```
+
+and here `return closeFrameCodec.Send(conn.ws, status)`. Then the rule that nothing else may call `ws.Write` isn't needed. The WebSocket tests this PR adds still pass for me with that change, `TestCloseWrite` also under `-race`.
+
+---- INLINE thc1006 2026-09-28T06:57:24Z pkg/client/tests/exec_slow_client_test.go:140
+The WebSocket executor doesn't use `Config.Dial`. `RoundTripperFor` builds the gorilla dialer in `client-go/transport/websocket/roundtripper.go` from the TLS config and the proxy, with no `NetDialContext`, so this client's receive buffer isn't pinned. This case still failed 5 of 5 on the old code here, with the default buffers.
+
+
+---- INLINE thc1006 2026-09-28T06:57:24Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go:119
+With the default idle timeouts (4h in `DefaultConfig` and in the translator) this doesn't happen before `finishTimeout`, so with those defaults the 15 minutes is the bound. The same sentence is in `apiserver/pkg/util/proxy/websocket.go`.
+
+---- INLINE thc1006 2026-09-28T07:52:07Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go:124
+The 15 minutes only bounds this select. `Reset`, the stream `Close` calls and `writeStatus` above it write SPDY frames with no write deadline, and the deferred `conn.Close` writes RST and GOAWAY frames the same way, so a peer that stops reading can hold the handler before the timer starts and again after it fires. `writeStatus` and `Close` behaved like that before this change too, so I'd either say so in the comment or give the finish writes a deadline. `TestServeExecFinishTimeoutBoundsWaitForClient` reads everything before it waits, so it doesn't cover a peer that stops reading.
+
+---- INLINE thc1006 2026-09-28T07:52:07Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_test.go:454
+These run as `close(stop)`, `writers.Wait()`, then `conn.Close()`. A stdin writer blocked in `WriteMessage` never gets to check `stop`, and the Wait keeps the connection open, so a failing run can hang until the package timeout. Closing the connection before the Wait avoids that.
+
+---- INLINE semx 2026-09-28T10:34:57Z staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn.go:361
+Fixed in 0cf6c397 (closeFrameCodec; TestCloseWrite).
+
+---- INLINE semx 2026-09-28T10:34:59Z pkg/client/tests/exec_slow_client_test.go:140
+Fixed in 0cf6c397: Dial removed, comment states the default buffer.
+
+---- INLINE semx 2026-09-28T10:35:01Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go:119
+Fixed in 0cf6c397: comment reworded; TestServeExecFinishTimeoutBoundsWaitForClient now runs with idleTimeout = finishTimeout/3.
+
+---- INLINE semx 2026-09-28T10:35:03Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go:124
+Fixed in 0cf6c397: write deadline of finishTimeout set in finish before the status and close frames.
+
+---- INLINE semx 2026-09-28T10:35:05Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_test.go:454
+Fixed in 0cf6c397: conn.Close() before writers.Wait().
+
+---- INLINE aojea 2026-10-01T09:59:52Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go:102
+This is the main problems on half close network architectures, you always need to set an upper bound because you already signaled the other part that your closing. You can see that both containerd and socat allows a graceful termination of 0.5 seconds https://github.com/containerd/containerd/commit/7361cf86217573819ad210891a552060275730a6
+
+
+15 minutes looks excessive and also a vector attack for ddosing the apiserver
+
+---- INLINE semx 2026-10-01T14:22:20Z staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go:102
+Agreed, 15 minutes is far more than the wait needs. I measured what clients actually need and what they can already hold; the numbers are in https://github.com/kubernetes/kubernetes/issues/142376#issuecomment-5933424777. In short: 500 ms cuts even a fast client on a LAN, and with `pods/exec` a client can already hold a session for hours (the translator's idle timeout is a fixed 4h). I'd rather bound the wait by progress than by a fixed time, and I'll propose that in the KEP you suggested. One more thing turned up: on WebSocket the write deadline here doesn't hold at all, since wsstream resets it to the idle timeout on every write. That's older than this PR; details and a separate fix are in the same comment.
+
+
