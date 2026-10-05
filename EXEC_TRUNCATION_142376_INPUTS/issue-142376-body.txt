@@ -1,0 +1,283 @@
+TITLE: Exec drops end of stdout when client reads slowly
+STATE: open
+AUTHOR: knoppiks
+CREATED: 2026-09-24T08:15:17Z
+
+### What happened?
+
+I tried to take a backup of a pod's data using `kubectl exec`. When inspecting file sizes the files seemed not to be the same. After some testing and experiments, I found the issue to occur only when the client reads slower than the (in-pod) process writes (to stdout). Only the end of the stream was missing, the beginning was intact. `kubectl exec` often exited with 0, with nothing on stderr. So the truncated result could not be told apart from a complete one. `kubectl cp` fails the same way when the client is behind a slow link with `error: unexpected EOF` (copying to a fast local disk did not fail). The error occurred using the older SPDY transport as well as WebSockets.
+
+**kind v1.37.0, two nodes, kubectl v1.37.0; pod writes 32 MiB, client reads at 1MiB/s**
+
+path | truncated reads | # of those with exit 0 + empty stderr
+-- | -- | --
+kubectl exec, WebSocket (default) | 3/5 | 0
+kubectl exec, SPDY | 5/5 | 5
+crictl exec on the node, same reader | 5/5 | 5
+crictl exec on the node, reader not throttled | 0/5 |  
+kubectl exec, process sleeps 45 s after its last write | 0/1 |  
+
+* crictl exec on the node, where only the CRI streaming server is involved, already truncates
+* packet captures have shown the kubelet passes everything it received, so bytes are lost at the streaming server & apiserver -> client connection
+
+### What did you expect to happen?
+
+Everything the remote (in-pod) process wrote should have reached the client, or the client should exit with a non-zero exit code.
+
+### How can we reproduce it (as minimally and precisely as possible)?
+
+I let a coding agent reproduce the error in various ways (k3s, kind, crictl, k8s versions from 1.30 to 1.37), full measurements, per-hop packet captures and scripts: https://github.com/knoppiks/k8s-exec-truncation-repro
+
+I ran the reproduction myself, on multiple nodes. With the folowing script
+<details open>
+<summary>Script to reproduce</summary>
+
+```bash
+cat <<'EOF' | kind create cluster --name trunc --config -
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes: [{role: control-plane}, {role: worker}]
+EOF
+kubectl run payload --image=alpine:3.22 --restart=Never \
+  --overrides='{"spec":{"nodeName":"trunc-worker"}}' -- sleep infinity
+kubectl wait --for=condition=Ready pod/payload --timeout=120s
+
+# The container writes exactly 32 MiB (33554432 bytes) and exits 0.
+PAYLOAD='head -c 33554432 /dev/zero'
+
+# A reader that consumes 1 MiB per second and prints how many bytes it got.
+slow_count() {
+  total=0
+  while n=$(head -c 1048576 | wc -c) && [ "$n" -gt 0 ]; do
+    total=$((total + n)); sleep 1
+  done
+  echo "got=$total"
+}
+
+# 1) kubectl exec through the apiserver: WebSocket (default), then SPDY.
+for ws in true false; do
+  echo -n "kubectl exec, websockets=$ws: "
+  KUBECTL_REMOTE_COMMAND_WEBSOCKETS=$ws kubectl exec payload -- sh -c "$PAYLOAD" | slow_count
+  echo "  kubectl exit code: ${PIPESTATUS[0]}"
+done
+
+# 2) The same reader on the node, reading crictl exec directly: only the CRI
+#    streaming server is in the path. No kubelet, apiserver or network.
+id=$(docker exec trunc-worker crictl ps --name payload -q)
+echo -n "crictl exec on the node: "
+docker exec trunc-worker bash -c "$(declare -f slow_count)
+  crictl exec $id sh -c '$PAYLOAD' | slow_count
+  echo \"  crictl exit code: \${PIPESTATUS[0]}\""
+
+# Control: keep the process alive until the reader has caught up.
+echo -n "kubectl exec, 'sleep 45' after the last write: "
+kubectl exec payload -- sh -c "$PAYLOAD; sleep 45" | slow_count
+```
+</details>
+
+**Sample output**
+<details>
+<summary>Setup</summary>
+
+```console
+09:23 $ cat <<'EOF' | kind create cluster --name trunc --config -
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes: [{role: control-plane}, {role: worker}]
+EOF
+Creating cluster "trunc" ...
+ ✓ Ensuring node image (kindest/node:v1.37.0) 🖼
+ ✓ Preparing nodes 📦 📦  
+ ✓ Writing configuration 📜 
+ ✓ Starting control-plane 🕹 
+ ✓ Installing CNI 🔌 
+ ✓ Installing StorageClass 💾 
+ ✓ Joining worker nodes 🚜 
+Set kubectl context to "kind-trunc"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-trunc
+
+Have a question, bug, or feature request? Let us know! https://kind.sigs.k8s.io/#community 🙂
+
+09:26 $ kubectl cluster-info --context kind-trunc
+Kubernetes control plane is running at https://127.0.0.1:33907
+CoreDNS is running at https://127.0.0.1:33907/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+
+To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
+
+09:26 $ kubectl run payload --image=alpine:3.22 --restart=Never \
+  --overrides='{"spec":{"nodeName":"trunc-worker"}}' -- sleep infinity
+pod/payload created
+
+09:26 $ kubectl --context kind-trunc get pod
+NAME      READY   STATUS    RESTARTS   AGE
+payload   1/1     Running   0          7s
+
+09:26 $ kubectl --context kind-trunc get no
+NAME                  STATUS   ROLES           AGE   VERSION
+trunc-control-plane   Ready    control-plane   41s   v1.37.0
+trunc-worker          Ready    <none>          31s   v1.37.0
+
+09:26 $ kubectl wait --for=condition=Ready pod/payload --timeout=120s
+pod/payload condition met
+
+09:26 $ docker ps
+CONTAINER ID   IMAGE                  COMMAND                  CREATED              STATUS          PORTS                       NAMES
+f08d44c89425   kindest/node:v1.37.0   "/usr/local/bin/entr…"   About a minute ago   Up 59 seconds   127.0.0.1:33907->6443/tcp   trunc-control-plane
+224802ad6d0a   kindest/node:v1.37.0   "/usr/local/bin/entr…"   About a minute ago   Up 59 seconds                               trunc-worker
+
+09:26 $ PAYLOAD='head -c 33554432 /dev/zero'
+
+09:27 $ # A reader that consumes 1 MiB per second and prints how many bytes it got.
+slow_count() {
+  total=0
+  while n=$(head -c 1048576 | wc -c) && [ "$n" -gt 0 ]; do
+    total=$((total + n)); sleep 1
+  done
+  echo "got=$total"
+}
+```
+</details>
+
+<details>
+<summary>First run (kubectl ws/spdy, crictl, kubectl with sleep 45)</summary>
+
+```console
+09:27 $ for ws in true false; do
+  echo -n "kubectl exec, websockets=$ws: "
+  KUBECTL_REMOTE_COMMAND_WEBSOCKETS=$ws kubectl exec payload -- sh -c "$PAYLOAD" | slow_count
+  echo "  kubectl exit code: ${PIPESTATUS[0]}"
+done
+kubectl exec, websockets=true: E0924 09:27:39.427550  291063 v2.go:168] "Copying stderr failed" err="next reader: read tcp 127.0.0.1:51982->127.0.0.1:33907: read: connection reset by peer"
+E0924 09:27:39.427576  291063 v2.go:151] "Copying stdout failed" err="next reader: read tcp 127.0.0.1:51982->127.0.0.1:33907: read: connection reset by peer"
+error: error reading from error stream: next reader: read tcp 127.0.0.1:51982->127.0.0.1:33907: read: connection reset by peer
+got=27947650
+  kubectl exit code: 1
+kubectl exec, websockets=false: got=33554432
+  kubectl exit code: 0
+
+09:28 $ id=$(docker exec trunc-worker crictl ps --name payload -q)
+
+09:28 $ echo -n "crictl exec on the node: "
+crictl exec on the node:
+09:29 $ docker exec trunc-worker bash -c "$(declare -f slow_count)
+  crictl exec $id sh -c '$PAYLOAD' | slow_count
+  echo \"  crictl exit code: \${PIPESTATUS[0]}\""
+got=32362293
+  crictl exit code: 0
+
+09:29 $ echo -n "kubectl exec, 'sleep 45' after the last write: "
+kubectl exec, 'sleep 45' after the last write:
+09:29 $ kubectl exec payload -- sh -c "$PAYLOAD; sleep 45" | slow_count
+got=33554432
+```
+</details>
+<details>
+<summary>Second run (kubectl ws/spdy)</summary>
+
+```console
+09:30 $ for ws in true false; do   echo -n "kubectl exec, websockets=$ws: ";   KUBECTL_REMOTE_COMMAND_WEBSOCKETS=$ws kubectl exec payload -- sh -c "$PAYLOAD" | slow_count;   echo "  kubectl exit code: ${PIPESTATUS[0]}"; done
+kubectl exec, websockets=true: E0924 09:31:18.537607  292110 v2.go:168] "Copying stderr failed" err="next reader: read tcp 127.0.0.1:54760->127.0.0.1:33907: read: connection reset by peer"
+E0924 09:31:18.537655  292110 v2.go:151] "Copying stdout failed" err="next reader: read tcp 127.0.0.1:54760->127.0.0.1:33907: read: connection reset by peer"
+error: error reading from error stream: next reader: read tcp 127.0.0.1:54760->127.0.0.1:33907: read: connection reset by peer
+got=27620675
+  kubectl exit code: 1
+kubectl exec, websockets=false: got=31951300
+  kubectl exit code: 0
+```
+</details>
+
+<details>
+<summary>GitHub Actions</summary>
+The reproduction repository also runs the same measurement on GitHub Actions:
+
+run | what | result
+---|---|---
+35825454478 (https://github.com/knoppiks/k8s-exec-truncation-repro/actions/runs/35825454478) |kubectl exec on k3s 1.30, 1.32, 1.34, 1.36 (tunnel on/off, pod on server/agent) and kind v1.35.0 with kubectl v1.35.0 | 30/40 truncated, 11 of those with exit 0
+35857834469 (https://github.com/knoppiks/k8s-exec-truncation-repro/actions/runs/35857834469) | the corrected ladder on k3s v1.36.4, including crictl exec alone | crictl 2/2 truncated; apiserver path 6/8
+</details>
+
+### Anything else we need to know?
+
+The issue seems related to
+* #60140, which was closed as not reproducible, using local copies (I'd assume a fast reader, which didn't fail in my tests either).
+* #124571, closed as stale
+* containerd/containerd#13934, similar but stdin and containerd code, while our bug is Kubernetes code (k8s.io/cri-streaming)
+
+### Kubernetes version
+
+<details>
+
+```console
+$ kubectl version
+Client Version: v1.37.0
+Kustomize Version: v5.8.1
+Server Version: v1.37.0
+```
+</details>
+
+
+### Cloud provider
+
+<details>
+
+None: kind v0.33.0 (two nodes) on a local docker host.
+</details>
+
+
+### OS version
+
+<details>
+
+```console
+# Host (runs docker, the kind nodes and kubectl)
+$ cat /etc/os-release
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+NAME="Ubuntu"
+VERSION_ID="26.04"
+VERSION="26.04.1 LTS (Resolute Raccoon)"
+VERSION_CODENAME=resolute
+ID=ubuntu
+ID_LIKE=debian
+$ uname -srvmo
+Linux 7.0.0-31-generic #31-Ubuntu SMP PREEMPT_DYNAMIC Sat Aug  1 04:26:38 UTC 2026 x86_64 GNU/Linux
+
+# kind node image (kindest/node:v1.37.0), userland only
+$ cat /etc/os-release
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+VERSION_ID="13"
+DEBIAN_VERSION_FULL=13.6
+ID=debian
+```
+
+</details>
+
+
+### Install tools
+
+<details>
+kind v0.33.0, node image kindest/node:v1.37.0
+</details>
+
+
+### Container runtime (CRI) and version (if applicable)
+
+<details>
+
+```console
+$ crictl version
+Version:  0.1.0
+RuntimeName:  containerd
+RuntimeVersion:  v2.3.4
+RuntimeApiVersion:  v1
+```
+</details>
+
+
+### Related plugins (CNI, CSI, ...) and versions (if applicable)
+
+<details>
+kind defaults (kindnet). Not involved: the loss also occurs with crictl on the node.
+</details>
+

@@ -1,0 +1,167 @@
+---- kubernetes-prow[bot] 2026-09-24T08:15:27Z
+This issue is currently awaiting triage.
+
+If a SIG or subproject determines this is a relevant issue, they will accept it by applying the `triage/accepted` label and provide further guidance.
+
+The `triage/accepted` label can be added by org members by writing `/triage accepted` in a comment.
+
+
+<details>
+
+Instructions for interacting with me using PR comments are available [here](https://git.k8s.io/community/contributors/guide/pull-requests.md).  If you have questions or suggestions related to my behavior, please file an issue against the [kubernetes-sigs/prow](https://github.com/kubernetes-sigs/prow/issues/new?title=Prow%20issue:) repository.
+</details>
+
+---- knoppiks 2026-09-24T08:17:29Z
+/sig node
+/sig api-machinery
+/sig cli
+
+---- herefindalex 2026-09-25T06:49:34Z
+I reproduced the silent truncation with a localhost test using `cri-streaming`’s `ServeExec` and the client-go SPDY executor. The test does not involve containerd, kubelet, or apiserver.
+
+A mock executor wrote exactly 33,554,432 bytes. With a client reading at about 1 MiB/s, it received 32,407,552 bytes, but `StreamWithContext` returned nil and stderr was empty. A fast reader received all bytes. A slow reader also received all bytes when the executor waited for it to drain before returning.
+
+The closing sequence looks relevant. [`ServeExec`](https://github.com/kubernetes/kubernetes/blob/90777f0b13827dcae8301137ea64f699f3449dbc/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/exec.go#L79-L113) writes a success status when the executor returns, then closes the connection. The [SPDY connection’s `Close`](https://github.com/kubernetes/kubernetes/blob/90777f0b13827dcae8301137ea64f699f3449dbc/staging/src/k8s.io/streaming/pkg/httpstream/spdy/connection.go#L105-L119) resets its streams. The test suggests stdout can still be in flight at that point, while the success status has already reached the client.
+
+There may be a second loss point in the [apiserver upgrade proxy](https://github.com/kubernetes/kubernetes/blob/90777f0b13827dcae8301137ea64f699f3449dbc/staging/src/k8s.io/apimachinery/pkg/util/proxy/upgradeaware.go#L412-L452): it closes both connections when either copy direction finishes. I have not isolated that path in a test yet, so I would treat it as a separate hypothesis.
+
+Could you confirm the expected contract: should a successful exec result mean stdout and stderr have been fully delivered to the client, or should incomplete delivery produce an error? Would you prefer the confirmed CRI streaming case and the possible apiserver proxy case addressed in separate PRs?
+
+---- thc1006 2026-09-26T16:14:26Z
+I repeated the reproduction from the issue on a kubeadm cluster (v1.37.0) with four worker nodes. The silent truncation shows up on every node, including one on containerd 2.4.0, which vendors `k8s.io/cri-streaming` v0.37.0. Same payload and reader as the script, 20 runs per cell, shuffled.
+
+Counts are runs that came back short with exit 0 and nothing on stderr:
+
+| node | path to the API server | containerd | `kubectl exec`, SPDY | `crictl exec` on the node |
+|---|---|---|---|---|
+| A (VM) | WAN, ~188 ms RTT | 2.2.2 | 18/20 | 13/20 |
+| B (VM) | WAN, ~134 ms RTT | 2.2.2 | 5/20 | 12/20 |
+| C (bare metal) | LAN, ~0.2 ms | 2.2.2 | 18/20 | 20/20 |
+| D (bare metal) | LAN, ~0.3 ms | 2.4.0 | 14/20 | 20/20 |
+
+WebSocket lost data in all 80 runs too, but every one exited 1 with `error reading from error stream` on stderr. When the command slept 45 s after the last write, all 160 control runs (WebSocket and SPDY) got the full 33554432 bytes.
+
+On node D, exec goes through `ServeExec` from `k8s.io/cri-streaming`, the code herefindalex tested in isolation, and it fails the same way inside containerd. Master has only changed its exit-error handling since v0.37.0, not the close sequence. containerd 2.2.2 serves exec from its own copy in `internal/cri/streamingserver` and truncates the same way, so the 2.2 line would need its own change.
+
+Latency doesn't look like the driver: C on the LAN and A over the WAN both hit 18/20 with SPDY. B's lower SPDY rate comes from its congestion control. B was the only node on cubic (the others use bbr). After switching B to bbr, 20 of 20 SPDY runs were silently short, against 1 of 20 on cubic.
+
+<details>
+<summary>Method and more numbers</summary>
+
+- payload `head -c 33554432 /dev/zero` and the `head -c 1048576 | wc -c; sleep 1` reader loop, both as in the issue script
+- kubectl v1.37.0 on the control plane host, crictl v1.37.0 on every node, transport set with `KUBECTL_REMOTE_COMMAND_WEBSOCKETS`
+- node C's kubelet is v1.37.1, the other kubelets are v1.37.0; nothing under `cri-streaming`, `streaming` or `pkg/kubelet/server` changed between the two
+- 400 runs, none invalid; the WAN nodes ran first and the LAN nodes right after, with similar load on the client host
+- Fisher's exact test, SPDY: A vs C p=1.0, B vs each of A, C and D p<=0.011; crictl: each VM vs each bare-metal node p<=0.009
+- in the truncated runs the median share received was 73% to 94% for SPDY, 89% to 96% for crictl and 45% to 80% for WebSocket
+- the reader sits on the control plane host for kubectl and on the node for crictl, so these numbers don't isolate the apiserver proxy
+- the VMs and the bare-metal nodes also differ in kernel and hardware, so the crictl gap may have nothing to do with the network
+- B's bbr/cubic runs: 40 SPDY runs back to back, bbr, cubic, cubic, bbr repeated 10 times, qdisc left at fq_codel, Fisher p<0.001. The switch changes `net.ipv4.tcp_congestion_control`, the default for new TCP connections on the whole node, so it doesn't show which hop matters. B on cubic was 5/20 in the table and 1/20 here (p=0.18 between the two)
+
+</details>
+
+
+---- neolit123 2026-09-28T07:52:32Z
+while https://github.com/kubernetes/kubernetes/pull/142461 may or may not be accepted, IIUC the right way to 'backup' is with this checkpoint/restore feature:
+https://github.com/kubernetes/enhancements/blob/17efff8d336bb4366a458a22a08a805ae8722ecc/keps/sig-node/5823-pod-level-checkpoint-restore/README.md
+a WG was formed too https://github.com/kubernetes/community/blob/a0b641801c6099de5886621cf8d667d6b75615b4/wg-checkpoint-restore/README.md
+
+
+
+
+---- semx 2026-09-29T10:47:52Z
+Downstream plan for this fix. #142461 carries all three pieces: the streaming server (`k8s.io/cri-streaming`, with `CloseWrite`/`CloseChan` added to the wsstream connection in `k8s.io/streaming`), the WebSocket translator used by the apiserver and the kubelet, and client-go.
+
+| Target | What | When |
+|---|---|---|
+| kubernetes release-1.37, 1.36 | cherry-pick of #142461 as is | after it merges; next patch releases 1.37.2 and 1.36.6 on 2026-10-13, cherry-pick deadline 2026-10-09 |
+| kubernetes release-1.35 | manual backport: there the streaming server lives in `k8s.io/kubelet/pkg/cri/streaming` and wsstream in `k8s.io/apimachinery` | same schedule (1.35.10) |
+| kubernetes release-1.34 | only if it still makes 1.34.13 (same deadline); the branch reaches end of life on 2026-10-27 | |
+| containerd main and release/2.4 (cri-streaming v0.37.0) | bump `k8s.io/cri-streaming` and `k8s.io/streaming` to the v0.37.x tag with the fix | after the tag |
+| containerd release/2.3 (v0.36.3) | same bump to v0.36.x | after the tag |
+| containerd release/2.2 | its own copy in `internal/cri/streamingserver` sits on the wsstream of apimachinery v0.34, whose connection has no way to send a close frame without closing the socket; the port either carries the needed wsstream pieces inside containerd or bumps apimachinery to a v0.35.x with the backport, whichever the maintainers prefer | draft PR while #142461 is in review, marked as depending on it |
+| containerd release/2.0 (LTS) | vendors `k8s.io/kubelet` v0.31, which gets no more patch releases; a fix there needs the same self-contained port, maintainers' call | on request |
+| CRI-O main and release-1.37 (cri-streaming v0.37.0) | bump `k8s.io/cri-streaming` and `k8s.io/streaming` to v0.37.x | after the tag |
+| CRI-O release-1.36 (v0.36.3) | same bump to v0.36.x | after the tag |
+| CRI-O release-1.35 (`k8s.io/kubelet` v0.35.7) | bump `k8s.io/kubelet` and `k8s.io/apimachinery` to the v0.35.x with the backport | after the tag |
+
+containerd release/2.1 reached end of life in July 2026 and is out of scope.
+
+Validation for every PR: the unit tests from #142461 ported with the code, plus the large-output `kubectl exec` reproduction from this issue over both WebSocket and SPDY against the patched runtime, checking that the output is complete and the exit code is preserved.
+
+I am taking all of the above; every PR will reference #142376 and #142461. @thc1006, a run of your four-node reproduction against the containerd builds would be a useful validation once those PRs are up.
+
+
+---- aojea 2026-10-01T10:42:14Z
+IIUIC the process in the pod has already finished and written all its output, and then containerd/crio starts closing the connection. 
+Depending on the transport SPDY or WebSocket the symptoms are different, but in both cases what you see is a cascade of errors triggered because the server side closed the underlying TCP socket while data was still buffered (because the client didn't drained it yet)
+
+This is a graceful termination / half-close problem across multiple proxied hops. If you see the different legs involved you'll see why this is not something we can fix with one drive-by PR:
+
+```
+[kubectl (client-go)]
+   │  WebSocket (v5.channel.k8s.io) or SPDY (v4.channel.k8s.io)
+   ▼
+[kube-apiserver]  proxy, or WebSocket→SPDY translator
+   │  WebSocket (v5, 1.36+ ExtendWebSocketsToKubelet) or SPDY (v4)
+   ▼
+[kubelet]  proxy, or WebSocket→SPDY translator
+   │  SPDY (v4.channel.k8s.io)
+   ▼
+[CRI streaming server (containerd / CRI-O, vendoring k8s.io/cri-streaming)]
+   │  pipes
+   ▼
+[process in the container]
+```
+
+Because this require multiple components (apiserver, kubelet, containerd/crio) we need to clearly define the rollout to handle the compatibility. This also has a risk of allowing ddos scenarios by holding resources open. 
+
+I am inclined to ask for a KEP that defines the protocol change, the per-component rollout and the compatibility matrix. KEP-4006 (https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/4006-transition-spdy-to-websockets) is a good reference.
+
+The issue also has a workaround (keep the process alive after its last write, or verify sizes/checksums on the receiving side). And a reminder: exec, attach, cp and port-forward are listed under "Troubleshooting and Debugging Commands" for a reason. Kubernetes has proper APIs for exposing and moving workload data (Services, LoadBalancers, volumes); building production data paths on the debugging streaming APIs is not recommended
+
+
+
+
+
+---- semx 2026-10-01T14:22:12Z
+Thanks, that matches what we see. You're right on both points: 15 minutes is more than the wait needs, and a change across every hop needs a KEP with a rollout plan. In short, from measurements on a real cluster (details below):
+
+- 500 ms cuts even a fast client on a LAN, and 30 s already cuts a 256 KiB/s reader; on SPDY every cut run exits 0.
+- The wait does add something: a finished session can be held without a process for up to 15 minutes, which is cheaper than holding one with `sleep`, and no metric shows it while it waits. The ceiling doesn't change: a client that stops reading can already hold a session for 4h, because wsstream lets the idle timeout override write deadlines. That's older than this PR; the fix is #142596.
+- So the KEP should bound the wait on progress and make it visible (a gauge of waiting sessions, a counter of expiries). After the command exits the server writes nothing more, so progress there means the socket draining: visible on Linux (TIOCOUTQ or TCP_INFO), elsewhere only through the client's pings, which needs a floor on the rate.
+- On skew: in every mix I measured, each run the new client reported as failed had lost output, and against an all-old server it exits 0 normally (40 of 40). It can still be worse in one case, which follows from the code and didn't show up in my runs: an old server that loses only the status frame after the last byte. The old client calls that success, the new one an error; the KEP should decide between a typed error and a release note.
+
+I'll write the KEP with KEP-4006 as the model if SIG Node and SIG API Machinery agree. Would you be up for reviewing it?
+
+<details><summary>Measurements</summary>
+
+**How long does an honest client need?** I made the bound settable on one node and ran 16 MiB through `kubectl exec` with the reader capped, 5 runs per cell. Complete runs, out of 5, for WebSocket / SPDY:
+
+| bound | 16 MiB/s | 1 MiB/s | 256 KiB/s |
+|---|---|---|---|
+| 15 min | 5 / 5 | 5 / 5 | 5 / 5 |
+| 30 s | 5 / 5 | 5 / 5 | 2 / 0 |
+| 5 s | 5 / 5 | 2 / 0 | 0 / 0 |
+| 500 ms | 0 / 0 | 0 / 0 | 0 / 0 |
+
+Every SPDY run that came back short exited 0, and the only thing on stderr was a "Copying stdin failed" line from my stdin feeder, which complete runs print too. That's the original bug. The wait is roughly what's buffered between the runtime and the client (about 13 MiB on the SPDY path, going by the slow-reader runs) divided by the read rate: 0.6–3 s for the fast reader, up to 15 s at 1 MiB/s, up to 61 s at 256 KiB/s. So 500 ms truncates even a fast client on a LAN.
+
+**What can a client hold today?** With `pods/exec`, far more than 15 minutes. With `streamingConnectionIdleTimeout` and containerd's `stream_idle_timeout` both set to 1m on a node, `kubectl exec -- sleep 300` ran the full 300 s over WebSocket and over SPDY. A raw WebSocket client that sends nothing wasn't cut at 1m either: the WebSocket-to-SPDY translator has its own idle timeout, hard-coded to 4h (`defaultIdleConnectionTimeout`), and the kubelet setting doesn't reach it. That also means our doc comment saying a shorter idle timeout ends the wait sooner was wrong for the translator.
+
+While checking that, I found a worse hole, and it predates this PR. On the WebSocket path, wsstream moves the connection's deadline to the idle timeout on every frame it writes, so no write deadline set before a write holds: not the one `finish` sets, and not the 10s `writeErrorDeadline` either. A client that stops reading while the command is still writing keeps the session for the idle timeout, 4h, with or without this change, and longer if it keeps sending something. In a unit test, a write with a 300 ms deadline returned after the 4s idle timeout. Both doc comments now say what actually bounds those writes (fce8f6619e), and the fix for wsstream, with that test, is #142596. It's a bug on its own, and it's what the writes in `finish` need to be bounded on WebSocket.
+
+200 sessions held on one node, added to baseline:
+
+| | raw WebSocket client, `sleep 86400`, sends nothing (today) | raw WebSocket client, `echo hi`, never closes (this PR) |
+|---|---|---|
+| apiserver | +400 fds, +604 goroutines | +400 fds, +601 goroutines |
+| kubelet | +400 fds, +4001 goroutines | +199 fds, +401 goroutines |
+| containerd | +1001 fds | none, that leg is already closed |
+| processes in the container | +200 | 0 |
+
+The finished sessions in the right column hold no process and so cost the client less than the left one.
+
+</details>
+
+

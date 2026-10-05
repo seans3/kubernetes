@@ -1,0 +1,1889 @@
+diff --git a/pkg/client/tests/exec_slow_client_test.go b/pkg/client/tests/exec_slow_client_test.go
+new file mode 100644
+index 0000000000000..6557c60ad12fe
+--- /dev/null
++++ b/pkg/client/tests/exec_slow_client_test.go
+@@ -0,0 +1,315 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package tests
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	"k8s.io/apimachinery/pkg/util/proxy"
++	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
++	translator "k8s.io/apiserver/pkg/util/proxy"
++	restclient "k8s.io/client-go/rest"
++	remoteclient "k8s.io/client-go/tools/remotecommand"
++	clientspdy "k8s.io/client-go/transport/spdy"
++	"k8s.io/cri-streaming/pkg/streaming/remotecommand"
++	api "k8s.io/kubernetes/pkg/apis/core"
++	"k8s.io/streaming/pkg/httpstream"
++	"k8s.io/streaming/pkg/httpstream/spdy"
++)
++
++// payloadExecutor writes size bytes to stdout in 64 KiB chunks and returns.
++type payloadExecutor struct {
++	size int
++}
++
++func (e *payloadExecutor) ExecInContainer(_ context.Context, _ string, _ string, _ string, _ []string, _ io.Reader, out, _ io.WriteCloser, _ bool, _ <-chan remotecommand.TerminalSize, _ time.Duration) error {
++	chunk := make([]byte, 64<<10)
++	remaining := e.size
++	for remaining > 0 {
++		n := min(len(chunk), remaining)
++		if _, err := out.Write(chunk[:n]); err != nil {
++			return err
++		}
++		remaining -= n
++	}
++	return nil
++}
++
++// slowWriter counts what it receives and pauses after every write, like a
++// client draining stdout into a slow pipe.
++type slowWriter struct {
++	n     int
++	pause time.Duration
++}
++
++func (w *slowWriter) Write(p []byte) (int, error) {
++	w.n += len(p)
++	time.Sleep(w.pause)
++	return len(p), nil
++}
++
++// trickle yields one byte every period until stopped.
++type trickle struct {
++	stop   chan struct{}
++	period time.Duration
++}
++
++func (r *trickle) Read(p []byte) (int, error) {
++	select {
++	case <-r.stop:
++		return 0, io.EOF
++	case <-time.After(r.period):
++		p[0] = '\n'
++		return 1, nil
++	}
++}
++
++type proxyResponder struct{ t *testing.T }
++
++func (r proxyResponder) Error(_ http.ResponseWriter, _ *http.Request, err error) {
++	r.t.Errorf("proxy error: %v", err)
++}
++
++func parseURL(t *testing.T, s string) *url.URL {
++	t.Helper()
++	u, err := url.Parse(s)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return u
++}
++
++// A client that reads more slowly than the command writes must receive the
++// whole output, and the command's status, through the apiserver and the
++// kubelet: over SPDY both forward the upgraded connection, over WebSocket the
++// apiserver translates to SPDY towards the kubelet.
++func TestExecSlowClientThroughAPIServerAndKubelet(t *testing.T) {
++	const payload = 16 << 20
++	// The proxies forward to their configured location; the apiserver builds
++	// it, query included, from the exec options it validated.
++	const execPath = "/exec/pod/container?input=1&output=1&command=cmd"
++
++	for _, tc := range []struct {
++		name      string
++		apiserver func(t *testing.T, kubelet string) http.Handler
++		executor  func(t *testing.T, apiserver string) remoteclient.Executor
++	}{
++		{
++			name: "spdy",
++			apiserver: func(t *testing.T, kubelet string) http.Handler {
++				return proxy.NewUpgradeAwareHandler(parseURL(t, kubelet+execPath), nil, false, true, proxyResponder{t})
++			},
++			executor: func(t *testing.T, apiserver string) remoteclient.Executor {
++				// client-go pings every 5s; ping often so that the outcome does
++				// not depend on where in the transfer a ping falls.
++				rt, err := spdy.NewRoundTripperWithConfig(spdy.RoundTripperConfig{PingPeriod: 5 * time.Millisecond})
++				if err != nil {
++					t.Fatal(err)
++				}
++				rt.Dialer = smallReceiveBufferDialer()
++				e, err := remoteclient.NewSPDYExecutorForTransports(rt, clientspdy.NewUpgraderForStreaming(rt), http.MethodPost, parseURL(t, apiserver+execPath))
++				if err != nil {
++					t.Fatal(err)
++				}
++				return e
++			},
++		},
++		{
++			name: "websocket",
++			apiserver: func(t *testing.T, kubelet string) http.Handler {
++				return translator.NewStreamTranslatorHandler(parseURL(t, kubelet+execPath), nil, 0, translator.Options{Stdin: true, Stdout: true})
++			},
++			executor: func(t *testing.T, apiserver string) remoteclient.Executor {
++				// The WebSocket executor builds its own dialer, so this client's
++				// receive buffer stays at the default; the input frames arriving
++				// after the translator's close are enough to reset the connection.
++				config := &restclient.Config{Host: apiserver}
++				e, err := remoteclient.NewWebSocketExecutor(config, http.MethodPost, apiserver+execPath)
++				if err != nil {
++					t.Fatal(err)
++				}
++				return e
++			},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			backendDone := make(chan struct{})
++			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++				defer close(backendDone)
++				opts, err := remotecommand.NewOptions(req)
++				if err != nil {
++					http.Error(w, err.Error(), http.StatusBadRequest)
++					return
++				}
++				remotecommand.ServeExec(w, req, &payloadExecutor{size: payload}, "pod", "uid", "container", []string{"cmd"}, opts, time.Minute, remotecommand.DefaultStreamCreationTimeout, remotecommand.SupportedStreamingProtocols)
++			}))
++			t.Cleanup(backend.Close)
++			kubelet := httptest.NewServer(proxy.NewUpgradeAwareHandler(parseURL(t, backend.URL+execPath), nil, false, true, proxyResponder{t}))
++			t.Cleanup(kubelet.Close)
++			apiserverDone := make(chan struct{})
++			apiserverHandler := tc.apiserver(t, kubelet.URL)
++			apiserver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++				defer close(apiserverDone)
++				apiserverHandler.ServeHTTP(w, req)
++			}))
++			t.Cleanup(apiserver.Close)
++
++			executor := tc.executor(t, apiserver.URL)
++			stdout := &slowWriter{pause: 2 * time.Millisecond}
++			// Like a user typing into an interactive session, the client keeps
++			// sending input while the output is still arriving.
++			stdin := &trickle{stop: make(chan struct{}), period: 5 * time.Millisecond}
++			defer close(stdin.stop)
++			start := time.Now()
++			err := executor.StreamWithContext(context.Background(), remoteclient.StreamOptions{Stdin: stdin, Stdout: stdout})
++			elapsed := time.Since(start)
++
++			t.Logf("received %d of %d bytes in %v, err %v", stdout.n, payload, elapsed.Round(time.Millisecond), err)
++			if err != nil {
++				t.Errorf("exec failed: %v", err)
++			}
++			if stdout.n != payload {
++				t.Errorf("stdout truncated: got %d bytes, want %d (lost %d)", stdout.n, payload, payload-stdout.n)
++			}
++			for _, done := range []struct {
++				name string
++				ch   <-chan struct{}
++			}{{"apiserver", apiserverDone}, {"streaming server", backendDone}} {
++				select {
++				case <-done.ch:
++				case <-time.After(30 * time.Second):
++					t.Fatalf("the %s handler did not return after the client closed the connection", done.name)
++				}
++			}
++		})
++	}
++}
++
++// statuslessExecServer is a v4 server that closes the connection without ever
++// writing a status, which is what a streaming server from before this change
++// produced for a client that had not read everything when the command exited.
++// It negotiates v4, writes size bytes to stdout and returns.
++func statuslessExecServer(t *testing.T, size int) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		if _, err := httpstream.Handshake(req, w, []string{remotecommandconsts.StreamProtocolV4Name}); err != nil {
++			t.Error(err)
++			return
++		}
++		streams := make(chan httpstream.Stream, 4)
++		conn := spdy.NewResponseUpgrader().UpgradeResponse(w, req, func(stream httpstream.Stream, replySent <-chan struct{}) error {
++			streams <- stream
++			return nil
++		})
++		if conn == nil {
++			return
++		}
++		defer func() { _ = conn.Close() }()
++		var stdout httpstream.Stream
++		timeout := time.After(10 * time.Second)
++		for stdout == nil {
++			select {
++			case s := <-streams:
++				if s.Headers().Get(api.StreamType) == api.StreamTypeStdout {
++					stdout = s
++				}
++			case <-timeout:
++				t.Error("the client did not open a stdout stream")
++				return
++			}
++		}
++		chunk := make([]byte, 64<<10)
++		for remaining := size; remaining > 0; {
++			n := min(len(chunk), remaining)
++			if _, err := stdout.Write(chunk[:n]); err != nil {
++				return
++			}
++			remaining -= n
++		}
++	})
++}
++
++// A session that ends without a status is a failure, not a successful run: a
++// server that closes the connection before the client has read everything
++// (the servers this change fixes, still in place on nodes whose runtime has
++// not picked it up) used to make client-go return nil for a truncated stream.
++// The client reports it now, directly over SPDY and through the WebSocket
++// translator, which is a SPDY client itself.
++func TestExecWithoutStatusIsAnError(t *testing.T) {
++	const payload = 1 << 20
++	const execPath = "/exec/pod/container?output=1&command=cmd"
++
++	for _, tc := range []struct {
++		name     string
++		front    func(t *testing.T, backend string) http.Handler
++		executor func(t *testing.T, front string) remoteclient.Executor
++	}{
++		{
++			name: "spdy",
++			front: func(t *testing.T, backend string) http.Handler {
++				return proxy.NewUpgradeAwareHandler(parseURL(t, backend+execPath), nil, false, true, proxyResponder{t})
++			},
++			executor: func(t *testing.T, front string) remoteclient.Executor {
++				rt, err := spdy.NewRoundTripper(nil)
++				if err != nil {
++					t.Fatal(err)
++				}
++				e, err := remoteclient.NewSPDYExecutorForTransports(rt, clientspdy.NewUpgraderForStreaming(rt), http.MethodPost, parseURL(t, front+execPath))
++				if err != nil {
++					t.Fatal(err)
++				}
++				return e
++			},
++		},
++		{
++			name: "websocket through the translator",
++			front: func(t *testing.T, backend string) http.Handler {
++				return translator.NewStreamTranslatorHandler(parseURL(t, backend+execPath), nil, 0, translator.Options{Stdout: true})
++			},
++			executor: func(t *testing.T, front string) remoteclient.Executor {
++				e, err := remoteclient.NewWebSocketExecutor(&restclient.Config{Host: front}, http.MethodPost, front+execPath)
++				if err != nil {
++					t.Fatal(err)
++				}
++				return e
++			},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			backend := httptest.NewServer(statuslessExecServer(t, payload))
++			t.Cleanup(backend.Close)
++			front := httptest.NewServer(tc.front(t, backend.URL))
++			t.Cleanup(front.Close)
++
++			stdout := &slowWriter{}
++			err := tc.executor(t, front.URL).StreamWithContext(context.Background(), remoteclient.StreamOptions{Stdout: stdout})
++			t.Logf("received %d of %d bytes, err %v", stdout.n, payload, err)
++			if err == nil {
++				t.Fatal("StreamWithContext returned nil for a session that ended without a status")
++			}
++			if !strings.Contains(err.Error(), "before the command's status was received") {
++				t.Errorf("unexpected error: %v", err)
++			}
++		})
++	}
++}
+diff --git a/pkg/client/tests/exec_slow_client_unix_test.go b/pkg/client/tests/exec_slow_client_unix_test.go
+new file mode 100644
+index 0000000000000..650270e9446c9
+--- /dev/null
++++ b/pkg/client/tests/exec_slow_client_unix_test.go
+@@ -0,0 +1,44 @@
++//go:build !windows
++
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package tests
++
++import (
++	"net"
++	"syscall"
++)
++
++// smallReceiveBufferDialer returns a dialer whose sockets have a small, fixed
++// receive buffer. Output the client has not read yet then backs up in the
++// server's send buffer rather than in the client's receive buffer, which is
++// what a server that closes the socket too early discards; without it the
++// kernel's receive buffer autotuning can absorb the whole output and hide the
++// loss.
++func smallReceiveBufferDialer() *net.Dialer {
++	return &net.Dialer{
++		Control: func(_, _ string, c syscall.RawConn) error {
++			var err error
++			if cerr := c.Control(func(fd uintptr) {
++				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 64<<10)
++			}); cerr != nil {
++				return cerr
++			}
++			return err
++		},
++	}
++}
+diff --git a/pkg/client/tests/exec_slow_client_windows_test.go b/pkg/client/tests/exec_slow_client_windows_test.go
+new file mode 100644
+index 0000000000000..0484e6d322259
+--- /dev/null
++++ b/pkg/client/tests/exec_slow_client_windows_test.go
+@@ -0,0 +1,28 @@
++//go:build windows
++
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package tests
++
++import "net"
++
++// smallReceiveBufferDialer returns a plain dialer on Windows, where the tests
++// still check that the fix delivers everything but cannot pin the socket
++// buffers to make the old code fail reliably.
++func smallReceiveBufferDialer() *net.Dialer {
++	return &net.Dialer{}
++}
+diff --git a/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator.go b/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator.go
+index a85a5c5d0effe..c7f43a960380a 100644
+--- a/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator.go
++++ b/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator.go
+@@ -75,7 +75,7 @@ func (h *StreamTranslatorHandler) ServeHTTP(w http.ResponseWriter, req *http.Req
+ 	spdyRoundTripper, err := spdy.NewRoundTripperWithConfig(spdy.RoundTripperConfig{UpgradeTransport: h.Transport, PingPeriod: 5 * time.Second})
+ 	if err != nil {
+ 		metrics.IncStreamTranslatorRequest(req.Context(), strconv.Itoa(http.StatusInternalServerError))
+-		websocketStreams.writeStatus(apierrors.NewInternalError(err)) //nolint:errcheck
++		websocketStreams.finish(req.Context(), apierrors.NewInternalError(err))
+ 		return
+ 	}
+ 	spdyExecutor, err := remotecommand.NewSPDYExecutorRejectRedirects(
+@@ -86,7 +86,7 @@ func (h *StreamTranslatorHandler) ServeHTTP(w http.ResponseWriter, req *http.Req
+ 	)
+ 	if err != nil {
+ 		metrics.IncStreamTranslatorRequest(req.Context(), strconv.Itoa(http.StatusInternalServerError))
+-		websocketStreams.writeStatus(apierrors.NewInternalError(err)) //nolint:errcheck
++		websocketStreams.finish(req.Context(), apierrors.NewInternalError(err))
+ 		return
+ 	}
+ 
+@@ -125,27 +125,25 @@ func (h *StreamTranslatorHandler) ServeHTTP(w http.ResponseWriter, req *http.Req
+ 	// through the websocket error stream.
+ 	err = spdyExecutor.StreamWithContext(req.Context(), opts)
+ 	if err != nil {
+-		//nolint:errcheck   // Ignore writeStatus returned error
+ 		if statusErr, ok := err.(*apierrors.StatusError); ok {
+ 			// Increment status code returned within status error.
+ 			metrics.IncStreamTranslatorRequest(req.Context(), strconv.Itoa(int(statusErr.Status().Code)))
+-			websocketStreams.writeStatus(statusErr)
++			websocketStreams.finish(req.Context(), statusErr)
+ 		} else if exitErr, ok := err.(exec.CodeExitError); ok && exitErr.Exited() {
+ 			// Returned an exit code from the container, so not an error in
+ 			// stream translator--add StatusOK to metrics.
+ 			metrics.IncStreamTranslatorRequest(req.Context(), strconv.Itoa(http.StatusOK))
+-			websocketStreams.writeStatus(codeExitToStatusError(exitErr))
++			websocketStreams.finish(req.Context(), codeExitToStatusError(exitErr))
+ 		} else {
+ 			metrics.IncStreamTranslatorRequest(req.Context(), strconv.Itoa(http.StatusInternalServerError))
+-			websocketStreams.writeStatus(apierrors.NewInternalError(err))
++			websocketStreams.finish(req.Context(), apierrors.NewInternalError(err))
+ 		}
+ 		return
+ 	}
+ 
+ 	metrics.IncStreamTranslatorRequest(req.Context(), strconv.Itoa(http.StatusOK))
+-	// Write the success status back to the WebSocket client.
+-	//nolint:errcheck
+-	websocketStreams.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{
++	// Report success to the WebSocket client and let it close the connection.
++	websocketStreams.finish(req.Context(), &apierrors.StatusError{ErrStatus: metav1.Status{
+ 		Status: metav1.StatusSuccess,
+ 	}})
+ }
+diff --git a/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator_test.go b/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator_test.go
+index ffbd0f6359e64..cdc451d4a0dc1 100644
+--- a/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator_test.go
++++ b/staging/src/k8s.io/apiserver/pkg/util/proxy/streamtranslator_test.go
+@@ -76,7 +76,10 @@ func TestStreamTranslator_LoopbackStdinToStdout(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("error copying STDIN to STDOUT: %v", err)
+ 		}
+-
++		// A v4 server writes the command's status before it closes.
++		if err := ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer spdyServer.Close()
+ 	// Create StreamTranslatorHandler, which points upstream to fake SPDY server with
+@@ -177,6 +180,10 @@ func TestStreamTranslator_LoopbackStdinToStderr(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("error copying STDIN to STDERR: %v", err)
+ 		}
++		// A v4 server writes the command's status before it closes.
++		if err := ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer spdyServer.Close()
+ 	// Create StreamTranslatorHandler, which points upstream to fake SPDY server with
+@@ -391,6 +398,10 @@ func TestStreamTranslator_MultipleReadChannels(t *testing.T) {
+ 		if err != nil {
+ 			t.Errorf("error copying STDIN to STDOUT: %v", err)
+ 		}
++		// A v4 server writes the command's status before it closes.
++		if err := ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer spdyServer.Close()
+ 	// Create StreamTranslatorHandler, which points upstream to fake SPDY server with
+@@ -496,6 +507,10 @@ func TestStreamTranslator_ThrottleReadChannels(t *testing.T) {
+ 		if err != nil {
+ 			t.Errorf("error copying STDIN to STDOUT: %v", err)
+ 		}
++		// A v4 server writes the command's status before it closes.
++		if err := ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer spdyServer.Close()
+ 	// Create StreamTranslatorHandler, which points upstream to fake SPDY server with
+@@ -635,6 +650,10 @@ func TestStreamTranslator_TTYResizeChannel(t *testing.T) {
+ 			actualTerminalSize := <-ctx.resizeChan
+ 			actualTerminalSizes = append(actualTerminalSizes, actualTerminalSize)
+ 		}
++		// A v4 server writes the command's status before it closes.
++		if err := ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer spdyServer.Close()
+ 	// Create StreamTranslatorHandler, which points upstream to fake SPDY server with
+diff --git a/staging/src/k8s.io/apiserver/pkg/util/proxy/websocket.go b/staging/src/k8s.io/apiserver/pkg/util/proxy/websocket.go
+index 837c468108ba6..f3bc6943d0129 100644
+--- a/staging/src/k8s.io/apiserver/pkg/util/proxy/websocket.go
++++ b/staging/src/k8s.io/apiserver/pkg/util/proxy/websocket.go
+@@ -53,7 +53,7 @@ type Options struct {
+ // conns contains the connection and streams used when
+ // forwarding an attach or execute session into a container.
+ type conns struct {
+-	conn         io.Closer
++	conn         *wsstream.Conn
+ 	stdinStream  io.ReadCloser
+ 	stdoutStream io.WriteCloser
+ 	stderrStream io.WriteCloser
+@@ -63,6 +63,51 @@ type conns struct {
+ 	tty          bool
+ }
+ 
++// finishTimeout bounds how long the server waits for the client to close the
++// connection once the command has finished. The output still to be delivered
++// at that point is at most what the socket buffers on the way to the client
++// hold, tens of megabytes at the outside, which a client reading at 100 KB/s
++// drains in a few minutes. Only a client that neither reads nor closes for
++// this long is cut off.
++var finishTimeout = 15 * time.Minute
++
++// finish reports the status to the client and waits for the client to close
++// the connection.
++//
++// Closing the connection right after the status let the kernel reset it as
++// soon as the client's next frame arrived, discarding the output still in the
++// socket's send buffer: a client reading more slowly than the command wrote
++// got a truncated stream. So the server only signals the end of the session.
++// It closes its input channels, so that anything the client still sends is
++// discarded rather than queued, writes the status, sends the WebSocket close
++// frame and waits for the client to close the connection: client-go does so
++// once it has read everything, and any client's reply to the close frame ends
++// the read loop as well. The wait ends early if the request context is done,
++// and after finishTimeout at the latest; the connection's idle timeout,
++// defaultIdleConnectionTimeout, is longer and does not end it sooner. The
++// write deadline of finishTimeout set first does not yet bound the frames
++// written here for a peer that has stopped reading: wsstream moves the
++// connection's deadline to the idle timeout on every frame it writes, which
++// overrides it, as it overrides writeErrorDeadline in writeStatus.
++func (c *conns) finish(ctx context.Context, status *apierrors.StatusError) {
++	deadline := time.Now().Add(finishTimeout)
++	c.conn.SetWriteDeadline(time.Until(deadline))
++	for _, s := range []io.ReadCloser{c.stdinStream, c.resizeStream} {
++		if s != nil {
++			_ = s.Close()
++		}
++	}
++	_ = c.writeStatus(status)
++	_ = c.conn.CloseWrite()
++	timer := time.NewTimer(time.Until(deadline))
++	defer timer.Stop()
++	select {
++	case <-c.conn.CloseChan():
++	case <-ctx.Done():
++	case <-timer.C:
++	}
++}
++
+ // Create WebSocket server streams to respond to a WebSocket client. Creates the streams passed
+ // in the stream options.
+ func webSocketServerStreams(req *http.Request, w http.ResponseWriter, opts Options) (*conns, error) {
+diff --git a/staging/src/k8s.io/client-go/tools/remotecommand/errorstream.go b/staging/src/k8s.io/client-go/tools/remotecommand/errorstream.go
+index 23dd50778d261..8df77e391215c 100644
+--- a/staging/src/k8s.io/client-go/tools/remotecommand/errorstream.go
++++ b/staging/src/k8s.io/client-go/tools/remotecommand/errorstream.go
+@@ -29,6 +29,13 @@ type errorStreamDecoder interface {
+ 	decode(message []byte) error
+ }
+ 
++// emptyErrorStreamDecoder is implemented by decoders for protocols in which the
++// server always sends a status before it closes the error stream, so an error
++// stream that ends without any data means the session was cut short.
++type emptyErrorStreamDecoder interface {
++	decodeEmpty() error
++}
++
+ // watchErrorStream watches the errorStream for remote command error data,
+ // decodes it with the given errorStreamDecoder, sends the decoded error (or nil if the remote
+ // command exited successfully) to the returned error channel, and closes it.
+@@ -46,7 +53,11 @@ func watchErrorStream(logger klog.Logger, errorStream io.Reader, d errorStreamDe
+ 		case len(message) > 0:
+ 			errorChan <- d.decode(message)
+ 		default:
+-			errorChan <- nil
++			if ed, ok := d.(emptyErrorStreamDecoder); ok {
++				errorChan <- ed.decodeEmpty()
++			} else {
++				errorChan <- nil
++			}
+ 		}
+ 		close(errorChan)
+ 	}()
+diff --git a/staging/src/k8s.io/client-go/tools/remotecommand/fallback_test.go b/staging/src/k8s.io/client-go/tools/remotecommand/fallback_test.go
+index 85600d8963b94..167b61c3bbcbc 100644
+--- a/staging/src/k8s.io/client-go/tools/remotecommand/fallback_test.go
++++ b/staging/src/k8s.io/client-go/tools/remotecommand/fallback_test.go
+@@ -56,6 +56,10 @@ func TestFallbackClient_WebSocketPrimarySucceeds(t *testing.T) {
+ 		if err != nil {
+ 			t.Errorf("unexpected error %v", err)
+ 		}
++		// A v5 server writes the command's status before it closes.
++		if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer websocketServer.Close()
+ 
+@@ -126,6 +130,10 @@ func TestFallbackClient_SPDYSecondarySucceeds(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("error copying STDIN to STDOUT: %v", err)
+ 		}
++		// A v4 server writes the command's status before it closes.
++		if err := ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer spdyServer.Close()
+ 
+@@ -394,6 +402,10 @@ func TestFallbackClient_WebSocketHTTPSProxyNoFallback(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("websocket copy error: %v", err)
+ 		}
++		// A v5 server writes the command's status before it closes.
++		if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer websocketServer.Close() //nolint:errcheck
+ 
+diff --git a/staging/src/k8s.io/client-go/tools/remotecommand/spdy_test.go b/staging/src/k8s.io/client-go/tools/remotecommand/spdy_test.go
+index 2a6e83b4c9913..f4d47887fda31 100644
+--- a/staging/src/k8s.io/client-go/tools/remotecommand/spdy_test.go
++++ b/staging/src/k8s.io/client-go/tools/remotecommand/spdy_test.go
+@@ -451,6 +451,10 @@ func TestStreamRandomData(t *testing.T) {
+ 		defer ctx.conn.Close()
+ 
+ 		io.Copy(ctx.stdoutStream, ctx.stdinStream) //nolint:errcheck
++		// A v4 server writes the command's status before it closes.
++		if err := ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 
+ 	defer server.Close()
+diff --git a/staging/src/k8s.io/client-go/tools/remotecommand/v4.go b/staging/src/k8s.io/client-go/tools/remotecommand/v4.go
+index 47018ba5fec8f..63f9004944a10 100644
+--- a/staging/src/k8s.io/client-go/tools/remotecommand/v4.go
++++ b/staging/src/k8s.io/client-go/tools/remotecommand/v4.go
+@@ -85,6 +85,15 @@ func (p *streamProtocolV4) stream(logger klog.Logger, conn streamCreator, ready
+ // and creates an exec.ExitError from it.
+ type errorDecoderV4 struct{}
+ 
++// decodeEmpty reports an error stream that ended without a status. A v4 or v5
++// server writes the command's status before it closes the error stream, so an
++// empty one means the connection was closed before the command finished or
++// before the server's last frames were delivered, and the output may be
++// incomplete; it is not a successful run.
++func (d *errorDecoderV4) decodeEmpty() error {
++	return errors.New("connection closed before the command's status was received; the output may be incomplete")
++}
++
+ func (d *errorDecoderV4) decode(message []byte) error {
+ 	status := metav1.Status{}
+ 	err := json.Unmarshal(message, &status)
+diff --git a/staging/src/k8s.io/client-go/tools/remotecommand/v4_test.go b/staging/src/k8s.io/client-go/tools/remotecommand/v4_test.go
+index 217995415eae0..72c2800c5699f 100644
+--- a/staging/src/k8s.io/client-go/tools/remotecommand/v4_test.go
++++ b/staging/src/k8s.io/client-go/tools/remotecommand/v4_test.go
+@@ -20,8 +20,28 @@ import (
+ 	"fmt"
+ 	"strings"
+ 	"testing"
++
++	"k8s.io/klog/v2/ktesting"
+ )
+ 
++// An error stream that ends without any data is an error for v4 and v5, whose
++// servers write the status before closing it, and a success for v2 and v3,
++// whose error stream carries raw text.
++func TestEmptyErrorStream(t *testing.T) {
++	logger, _ := ktesting.NewTestContext(t)
++	if err := <-watchErrorStream(logger, strings.NewReader(""), &errorDecoderV4{}); err == nil {
++		t.Error("v4: an empty error stream was read as success")
++	} else if !strings.Contains(err.Error(), "before the command's status was received") {
++		t.Errorf("v4: unexpected error: %v", err)
++	}
++	if err := <-watchErrorStream(logger, strings.NewReader(""), &errorDecoderV2{}); err != nil {
++		t.Errorf("v2: an empty error stream is success, got %v", err)
++	}
++	if err := <-watchErrorStream(logger, strings.NewReader(""), &errorDecoderV3{}); err != nil {
++		t.Errorf("v3: an empty error stream is success, got %v", err)
++	}
++}
++
+ func TestV4ErrorDecoder(t *testing.T) {
+ 	dec := errorDecoderV4{}
+ 
+diff --git a/staging/src/k8s.io/client-go/tools/remotecommand/websocket_test.go b/staging/src/k8s.io/client-go/tools/remotecommand/websocket_test.go
+index ebfcaaade178d..f10b329c5aed6 100644
+--- a/staging/src/k8s.io/client-go/tools/remotecommand/websocket_test.go
++++ b/staging/src/k8s.io/client-go/tools/remotecommand/websocket_test.go
+@@ -69,6 +69,10 @@ func TestWebSocketClient_LoopbackStdinToStdout(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("error copying STDIN to STDOUT: %v", err)
+ 		}
++		// A v5 server writes the command's status before it closes.
++		if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer websocketServer.Close()
+ 
+@@ -144,6 +148,10 @@ func TestWebSocketClient_DifferentBufferSizes(t *testing.T) {
+ 			if err != nil {
+ 				t.Fatalf("error copying STDIN to STDOUT: %v", err)
+ 			}
++			// A v5 server writes the command's status before it closes.
++			if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++				t.Errorf("error writing status: %v", err)
++			}
+ 		}))
+ 		defer websocketServer.Close()
+ 
+@@ -218,6 +226,10 @@ func TestWebSocketClient_LoopbackStdinAsPipe(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("error copying STDIN to STDOUT: %v", err)
+ 		}
++		// A v5 server writes the command's status before it closes.
++		if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer websocketServer.Close()
+ 
+@@ -299,6 +311,10 @@ func TestWebSocketClient_LoopbackStdinToStderr(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("error copying STDIN to STDERR: %v", err)
+ 		}
++		// A v5 server writes the command's status before it closes.
++		if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer websocketServer.Close()
+ 
+@@ -373,6 +389,10 @@ func TestWebSocketClient_MultipleReadChannels(t *testing.T) {
+ 		if err != nil {
+ 			t.Errorf("error copying STDIN to STDOUT: %v", err)
+ 		}
++		// A v5 server writes the command's status before it closes.
++		if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer websocketServer.Close()
+ 	// Now create the WebSocket client (executor), and point it to the "websocketServer".
+@@ -633,6 +653,10 @@ func TestWebSocketClient_MultipleWriteChannels(t *testing.T) {
+ 		}
+ 		stdinReader.Close() // Stops the random STDIN stream generation
+ 		wg.Wait()           // Wait for all bytes copied from STDIN to STDOUT
++		// A v5 server writes the command's status before it closes.
++		if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++			t.Errorf("error writing status: %v", err)
++		}
+ 	}))
+ 	defer websocketServer.Close()
+ 	// Now create the WebSocket client (executor), and point it to the "websocketServer".
+@@ -1390,6 +1414,10 @@ func TestWebSocketClient_ProxySucceeds(t *testing.T) {
+ 			if err != nil {
+ 				t.Fatalf("error copying STDIN to STDOUT: %v", err)
+ 			}
++			// A v5 server writes the command's status before it closes.
++			if err := conns.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusSuccess}}); err != nil {
++				t.Errorf("error writing status: %v", err)
++			}
+ 		}))
+ 		defer websocketServer.Close() //nolint:errcheck
+ 
+diff --git a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/attach.go b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/attach.go
+index 7b1c6dd661833..a1b34fd3c46a8 100644
+--- a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/attach.go
++++ b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/attach.go
+@@ -43,14 +43,16 @@ func ServeAttach(w http.ResponseWriter, req *http.Request, attacher Attacher, po
+ 	}
+ 	defer ctx.conn.Close()
+ 
++	var status *streamStatusError
+ 	err := attacher.AttachContainer(req.Context(), podName, uid, container, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, ctx.tty, ctx.resizeChan)
+ 	if err != nil {
+ 		err = fmt.Errorf("error attaching to container: %v", err)
+ 		runtime.HandleError(err)
+-		ctx.writeStatus(newInternalError(err))
++		status = newInternalError(err)
+ 	} else {
+-		ctx.writeStatus(&streamStatusError{ErrStatus: streamStatus{
++		status = &streamStatusError{ErrStatus: streamStatus{
+ 			Status: statusSuccess,
+-		}})
++		}}
+ 	}
++	ctx.finish(req.Context(), status)
+ }
+diff --git a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/exec.go b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/exec.go
+index 4b97c1b0e9719..5e57dec3aa4b1 100644
+--- a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/exec.go
++++ b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/exec.go
+@@ -84,10 +84,11 @@ func ServeExec(w http.ResponseWriter, req *http.Request, executor Executor, podN
+ 	}
+ 	defer ctx.conn.Close()
+ 
++	var status *streamStatusError
+ 	err := executor.ExecInContainer(req.Context(), podName, uid, container, cmd, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, ctx.tty, ctx.resizeChan, 0)
+ 	if err != nil {
+ 		if rc, ok := exitCode(err); ok {
+-			_ = ctx.writeStatus(&streamStatusError{ErrStatus: streamStatus{
++			status = &streamStatusError{ErrStatus: streamStatus{
+ 				Status: statusFailure,
+ 				Reason: NonZeroExitCodeReason,
+ 				Details: &streamStatusDetails{
+@@ -99,15 +100,16 @@ func ServeExec(w http.ResponseWriter, req *http.Request, executor Executor, podN
+ 					},
+ 				},
+ 				Message: fmt.Sprintf("command terminated with non-zero exit code: %v", err),
+-			}})
++			}}
+ 		} else {
+ 			err = fmt.Errorf("error executing command in container: %v", err)
+ 			runtime.HandleError(err)
+-			_ = ctx.writeStatus(newInternalError(err))
++			status = newInternalError(err)
+ 		}
+ 	} else {
+-		_ = ctx.writeStatus(&streamStatusError{ErrStatus: streamStatus{
++		status = &streamStatusError{ErrStatus: streamStatus{
+ 			Status: statusSuccess,
+-		}})
++		}}
+ 	}
++	ctx.finish(req.Context(), status)
+ }
+diff --git a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go
+index d463bb51af986..ccee2b55e9c4b 100644
+--- a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go
++++ b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/httpstream.go
+@@ -66,17 +66,105 @@ func NewOptions(req *http.Request) (*Options, error) {
+ 	}, nil
+ }
+ 
++// connection is the transport connection of a session: an SPDY
++// httpstream.Connection or a WebSocket wsstream.Conn.
++type connection interface {
++	io.Closer
++	// CloseChan returns a channel that is closed once the connection has been
++	// closed by either side.
++	CloseChan() <-chan bool
++}
++
+ // connectionContext contains the connection and streams used when
+ // forwarding an attach or execute session into a container.
+ type connectionContext struct {
+-	conn         io.Closer
++	conn         connection
+ 	stdinStream  io.ReadCloser
+ 	stdoutStream io.WriteCloser
+ 	stderrStream io.WriteCloser
++	errorStream  io.WriteCloser
+ 	writeStatus  func(status *streamStatusError) error
+ 	resizeStream io.ReadCloser
+ 	resizeChan   chan TerminalSize
+ 	tty          bool
++	// stopInput discards any further input from the client.
++	stopInput func()
++	// endOutput tells the client that nothing more will be written.
++	endOutput func()
++}
++
++// finishTimeout bounds how long the server waits for the client to close the
++// connection once the command has finished. The output still to be delivered
++// at that point is at most what the socket buffers on the way to the client
++// hold, tens of megabytes at the outside, which a client reading at 100 KB/s
++// drains in a few minutes. Only a client that neither reads nor closes for
++// this long is cut off.
++var finishTimeout = 15 * time.Minute
++
++// finish reports the status of the command to the client and waits for the
++// client to close the connection.
++//
++// The connection must not be closed by the server while output may still be
++// in flight. The client keeps sending frames (pings, stream control) while it
++// reads, and data arriving on a socket the server has already closed makes
++// the kernel reset the connection and discard whatever is left in its send
++// buffer. A client that reads more slowly than the command wrote therefore
++// received a truncated stream, and since the status was discarded with it,
++// no error either. So the server only signals the end of the session, by
++// closing the streams the client reads from (SPDY) or by sending a close
++// frame (WebSocket), and closes the connection once the client has: client-go
++// closes it after it has read everything, and a WebSocket client's reply to
++// the close frame ends the read loop as well. The wait ends early if the
++// request context is done, and after finishTimeout at the latest. An idle
++// timeout shorter than that, if one is configured, ends it sooner for a client
++// that goes quiet; the default of four hours does not.
++//
++// The frames written here (status, stream close and reset) and the ones the
++// deferred connection close sends afterwards go to a socket the peer may have
++// stopped reading, so finish first sets a write deadline of finishTimeout on
++// the connection. On SPDY that bounds those writes like the wait. On
++// WebSocket it does not yet: wsstream moves the connection's deadline to the
++// idle timeout on every frame it writes, so there the idle timeout bounds
++// them, as it bounded the status write before. The command's own writes
++// before this point are bounded by the idle timeout only, as before.
++func (ctx *connectionContext) finish(reqCtx context.Context, status *streamStatusError) {
++	deadline := time.Now().Add(finishTimeout)
++	ctx.setWriteDeadline(deadline)
++	ctx.stopInput()
++	_ = ctx.writeStatus(status)
++	ctx.endOutput()
++	timer := time.NewTimer(time.Until(deadline))
++	defer timer.Stop()
++	select {
++	case <-ctx.conn.CloseChan():
++	case <-reqCtx.Done():
++	case <-timer.C:
++	}
++}
++
++// setWriteDeadline sets a write deadline on the connection, best effort: the
++// WebSocket connection takes a timeout directly, a SPDY stream sets the
++// deadline on the connection it belongs to.
++func (ctx *connectionContext) setWriteDeadline(t time.Time) {
++	type timeoutSetter interface {
++		SetWriteDeadline(time.Duration)
++	}
++	type deadlineSetter interface {
++		SetWriteDeadline(time.Time) error
++	}
++	if d, ok := ctx.conn.(timeoutSetter); ok {
++		d.SetWriteDeadline(time.Until(t))
++		return
++	}
++	for _, s := range []io.WriteCloser{ctx.errorStream, ctx.stdoutStream, ctx.stderrStream} {
++		if sr, ok := s.(streamAndReply); ok {
++			s = sr.Stream
++		}
++		if d, ok := s.(deadlineSetter); ok {
++			_ = d.SetWriteDeadline(t)
++			return
++		}
++	}
+ }
+ 
+ // streamAndReply holds both a Stream and a channel that is closed when the stream's reply frame is
+@@ -183,6 +271,24 @@ func createHTTPStreamStreams(req *http.Request, w http.ResponseWriter, opts *Opt
+ 
+ 	ctx.conn = conn
+ 	ctx.tty = opts.TTY
++	ctx.stopInput = func() {
++		// A reset, unlike a close, also drops what the client sends on the
++		// stream from now on instead of queueing it.
++		for _, s := range []io.ReadCloser{ctx.stdinStream, ctx.resizeStream} {
++			if stream, ok := s.(httpstream.Stream); ok {
++				_ = stream.Reset()
++			}
++		}
++	}
++	ctx.endOutput = func() {
++		// Closing a stream sends its FIN after everything written to it, so the
++		// client reads EOF once it has consumed all the output.
++		for _, s := range []io.WriteCloser{ctx.stdoutStream, ctx.stderrStream, ctx.errorStream} {
++			if s != nil {
++				_ = s.Close()
++			}
++		}
++	}
+ 
+ 	return ctx, true
+ }
+@@ -213,6 +319,7 @@ WaitForStreams:
+ 			streamType := stream.Headers().Get(StreamType)
+ 			switch streamType {
+ 			case StreamTypeError:
++				ctx.errorStream = stream
+ 				ctx.writeStatus = v4WriteStatusFunc(stream) // write json errors
+ 				go waitStreamReply(stream.replySent, replyChan, stop)
+ 			case StreamTypeStdin:
+@@ -264,6 +371,7 @@ WaitForStreams:
+ 			streamType := stream.Headers().Get(StreamType)
+ 			switch streamType {
+ 			case StreamTypeError:
++				ctx.errorStream = stream
+ 				ctx.writeStatus = v1WriteStatusFunc(stream)
+ 				go waitStreamReply(stream.replySent, replyChan, stop)
+ 			case StreamTypeStdin:
+@@ -315,6 +423,7 @@ WaitForStreams:
+ 			streamType := stream.Headers().Get(StreamType)
+ 			switch streamType {
+ 			case StreamTypeError:
++				ctx.errorStream = stream
+ 				ctx.writeStatus = v1WriteStatusFunc(stream)
+ 				go waitStreamReply(stream.replySent, replyChan, stop)
+ 			case StreamTypeStdin:
+@@ -363,6 +472,7 @@ WaitForStreams:
+ 			streamType := stream.Headers().Get(StreamType)
+ 			switch streamType {
+ 			case StreamTypeError:
++				ctx.errorStream = stream
+ 				ctx.writeStatus = v1WriteStatusFunc(stream)
+ 
+ 				// This defer statement shouldn't be here, but due to previous refactoring, it ended up in
+diff --git a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_test.go b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_test.go
+new file mode 100644
+index 0000000000000..d9d14962b66d3
+--- /dev/null
++++ b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_test.go
+@@ -0,0 +1,542 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package remotecommand
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	gwebsocket "github.com/gorilla/websocket"
++
++	"k8s.io/streaming/pkg/httpstream"
++	"k8s.io/streaming/pkg/httpstream/spdy"
++)
++
++const (
++	// slowPayload is what the command writes in the slow-reader tests: well
++	// above the send buffer of a socket, so that output is still in flight when
++	// the command finishes.
++	slowPayload = 16 << 20
++	// slowReadPause is the pause after every 64 KiB the slow reader takes,
++	// about 16 MiB/s.
++	slowReadPause = 4 * time.Millisecond
++	// fastPings is how often the clients in these tests ping. client-go pings
++	// every 5s; pinging often makes the outcome independent of where in the
++	// transfer a ping falls.
++	fastPings = 5 * time.Millisecond
++)
++
++// payloadExecutor writes size bytes to stdout in 64 KiB chunks and returns
++// without reading stdin.
++type payloadExecutor struct {
++	size int
++}
++
++func (e *payloadExecutor) ExecInContainer(_ context.Context, _ string, _ string, _ string, _ []string, _ io.Reader, out, _ io.WriteCloser, _ bool, _ <-chan TerminalSize, _ time.Duration) error {
++	return e.write(out)
++}
++
++func (e *payloadExecutor) AttachContainer(_ context.Context, _ string, _ string, _ string, _ io.Reader, out, _ io.WriteCloser, _ bool, _ <-chan TerminalSize) error {
++	return e.write(out)
++}
++
++func (e *payloadExecutor) write(out io.Writer) error {
++	chunk := make([]byte, 64<<10)
++	for i := range chunk {
++		chunk[i] = byte(i)
++	}
++	remaining := e.size
++	for remaining > 0 {
++		n := min(len(chunk), remaining)
++		if _, err := out.Write(chunk[:n]); err != nil {
++			return err
++		}
++		remaining -= n
++	}
++	return nil
++}
++
++// streamServer serves exec (or attach) requests with the given executor and
++// idle timeout. done is closed when the handler returns.
++func streamServer(t *testing.T, executor *payloadExecutor, idleTimeout time.Duration, attach bool) (*httptest.Server, <-chan struct{}) {
++	t.Helper()
++	done := make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		defer close(done)
++		opts, err := NewOptions(req)
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		if attach {
++			ServeAttach(w, req, executor, "pod", "uid", "container", opts, idleTimeout, DefaultStreamCreationTimeout, SupportedStreamingProtocols)
++			return
++		}
++		ServeExec(w, req, executor, "pod", "uid", "container", []string{"cmd"}, opts, idleTimeout, DefaultStreamCreationTimeout, SupportedStreamingProtocols)
++	}))
++	t.Cleanup(server.Close)
++	return server, done
++}
++
++func execServer(t *testing.T, executor *payloadExecutor, idleTimeout time.Duration) (*httptest.Server, <-chan struct{}) {
++	return streamServer(t, executor, idleTimeout, false)
++}
++
++// spdyExecClient opens a session over SPDY the way client-go does, with the
++// given ping period, and creates the error and stdout streams, plus stdin if
++// requested.
++func spdyExecClient(t *testing.T, url string, pingPeriod time.Duration, stdin bool) (conn httpstream.Connection, stdinStream, stdout, errorStream httpstream.Stream) {
++	t.Helper()
++	rt, err := spdy.NewRoundTripperWithConfig(spdy.RoundTripperConfig{PingPeriod: pingPeriod})
++	if err != nil {
++		t.Fatal(err)
++	}
++	rt.Dialer = smallReceiveBufferDialer()
++	req, err := http.NewRequest(http.MethodPost, url, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Header.Set(httpstream.HeaderProtocolVersion, StreamProtocolV4Name)
++	resp, err := rt.RoundTrip(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	conn, err = rt.NewConnection(resp)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	headers := http.Header{}
++	headers.Set(StreamType, StreamTypeError)
++	if errorStream, err = conn.CreateStream(headers); err != nil {
++		t.Fatal(err)
++	}
++	if stdin {
++		headers.Set(StreamType, StreamTypeStdin)
++		if stdinStream, err = conn.CreateStream(headers); err != nil {
++			t.Fatal(err)
++		}
++	}
++	headers.Set(StreamType, StreamTypeStdout)
++	if stdout, err = conn.CreateStream(headers); err != nil {
++		t.Fatal(err)
++	}
++	return conn, stdinStream, stdout, errorStream
++}
++
++// readSlowly reads r to EOF, pausing after every read, and returns the byte count.
++func readSlowly(t *testing.T, r io.Reader, pause time.Duration) int {
++	t.Helper()
++	got := 0
++	buf := make([]byte, 64<<10)
++	for {
++		n, err := r.Read(buf)
++		got += n
++		if err == io.EOF {
++			return got
++		}
++		if err != nil {
++			t.Fatalf("read error after %d bytes: %v", got, err)
++		}
++		time.Sleep(pause)
++	}
++}
++
++func readStatus(t *testing.T, errorStream io.Reader) chan []byte {
++	t.Helper()
++	statusCh := make(chan []byte, 1)
++	go func() {
++		bs, _ := io.ReadAll(errorStream)
++		statusCh <- bs
++	}()
++	return statusCh
++}
++
++func waitFor(t *testing.T, ch <-chan struct{}, what string) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(30 * time.Second):
++		t.Fatalf("timed out waiting for %s", what)
++	}
++}
++
++func expectSuccess(t *testing.T, status []byte) {
++	t.Helper()
++	var st streamStatus
++	if err := json.Unmarshal(status, &st); err != nil {
++		t.Errorf("error stream did not carry a status: %v (%q)", err, status)
++	} else if st.Status != statusSuccess {
++		t.Errorf("unexpected status: %+v", st)
++	}
++}
++
++func closedChan(ch <-chan bool) <-chan struct{} {
++	done := make(chan struct{})
++	go func() {
++		<-ch
++		close(done)
++	}()
++	return done
++}
++
++// trickle yields one byte every period until stopped, like a user typing into
++// an interactive session while output is still arriving. Unlike a SPDY ping,
++// which waits for the previous pong to come back through the backlog, it keeps
++// the client sending frames while the server drains.
++type trickle struct {
++	stop   chan struct{}
++	period time.Duration
++}
++
++func (r *trickle) Read(p []byte) (int, error) {
++	select {
++	case <-r.stop:
++		return 0, io.EOF
++	case <-time.After(r.period):
++		p[0] = '\n'
++		return 1, nil
++	}
++}
++
++// startTrickle copies a trickle of input into w until the returned stop
++// function is called, which also waits for the copy to end.
++func startTrickle(w io.Writer, period time.Duration) (stop func()) {
++	r := &trickle{stop: make(chan struct{}), period: period}
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		_, _ = io.Copy(w, r)
++	}()
++	return func() {
++		close(r.stop)
++		<-done
++	}
++}
++
++// A client that reads more slowly than the command writes must still receive
++// everything the command wrote, and the status. Closing the connection right
++// after the status discarded the output the kernel had not delivered yet as
++// soon as the client sent its next frame.
++func TestServeExecSlowClientReceivesAllOutput(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		pingPeriod time.Duration
++		input      bool
++	}{
++		{name: "client pings", pingPeriod: fastPings},
++		{name: "client sends input", input: true},
++		{name: "client sends nothing", pingPeriod: 0},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			server, serverDone := execServer(t, &payloadExecutor{size: slowPayload}, time.Minute)
++			path := "/exec?output=1"
++			if tc.input {
++				path += "&input=1"
++			}
++			conn, stdin, stdout, errorStream := spdyExecClient(t, server.URL+path, tc.pingPeriod, tc.input)
++			statusCh := readStatus(t, errorStream)
++			if tc.input {
++				defer startTrickle(stdin, fastPings)()
++			}
++
++			start := time.Now()
++			got := readSlowly(t, stdout, slowReadPause)
++			elapsed := time.Since(start)
++			status := <-statusCh
++
++			// The client closes the connection once it has read everything,
++			// like client-go does.
++			_ = conn.Close()
++			waitFor(t, serverDone, "ServeExec to return after the client closed the connection")
++
++			t.Logf("received %d of %d bytes in %v, status %q", got, slowPayload, elapsed.Round(time.Millisecond), status)
++			if got != slowPayload {
++				t.Errorf("stdout truncated: got %d bytes, want %d (lost %d)", got, slowPayload, slowPayload-got)
++			}
++			expectSuccess(t, status)
++		})
++	}
++}
++
++// The server must not close the connection before the client does, for exec
++// and for attach.
++func TestServeWaitsForClientToClose(t *testing.T) {
++	for _, tc := range []struct {
++		name   string
++		attach bool
++		path   string
++	}{
++		{name: "exec", path: "/exec?output=1"},
++		{name: "attach", attach: true, path: "/attach?output=1"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			server, serverDone := streamServer(t, &payloadExecutor{size: 1 << 20}, time.Minute, tc.attach)
++			conn, _, stdout, errorStream := spdyExecClient(t, server.URL+tc.path, 0, false)
++			statusCh := readStatus(t, errorStream)
++
++			got := readSlowly(t, stdout, 0)
++			status := <-statusCh
++			if got != 1<<20 {
++				t.Errorf("got %d bytes, want %d", got, 1<<20)
++			}
++			expectSuccess(t, status)
++
++			// The client has all the output and the status, but has not closed
++			// the connection yet. The server must still be holding it open.
++			select {
++			case <-conn.CloseChan():
++				t.Fatal("the server closed the connection before the client did")
++			case <-serverDone:
++				t.Fatal("the handler returned before the client closed the connection")
++			case <-time.After(300 * time.Millisecond):
++			}
++
++			_ = conn.Close()
++			waitFor(t, serverDone, "the handler to return after the client closed the connection")
++		})
++	}
++}
++
++// A client that goes quiet without closing the connection holds the handler
++// only until the idle timeout expires.
++func TestServeExecIdleTimeoutBoundsWaitForClient(t *testing.T) {
++	const idleTimeout = 300 * time.Millisecond
++	server, serverDone := execServer(t, &payloadExecutor{size: 1 << 20}, idleTimeout)
++	// The server's timers start after the request arrives, so the handler
++	// cannot return before start+idleTimeout; a server that closed as soon as
++	// the command finished would return well before that.
++	start := time.Now()
++	conn, _, stdout, errorStream := spdyExecClient(t, server.URL+"/exec?output=1", 0, false)
++	statusCh := readStatus(t, errorStream)
++
++	got := readSlowly(t, stdout, 0)
++	<-statusCh
++	if got != 1<<20 {
++		t.Errorf("got %d bytes, want %d", got, 1<<20)
++	}
++
++	waitFor(t, serverDone, "ServeExec to return after the idle timeout")
++	elapsed := time.Since(start)
++	if elapsed < idleTimeout {
++		t.Errorf("ServeExec returned %v after the session started, before the idle timeout %v: it did not wait for the client", elapsed, idleTimeout)
++	}
++	if elapsed > 10*idleTimeout {
++		t.Errorf("ServeExec returned %v after the session started, idle timeout is %v", elapsed, idleTimeout)
++	}
++	// The connection is closed for the client as well.
++	waitFor(t, closedChan(conn.CloseChan()), "the client connection to be closed")
++}
++
++// A client that keeps pinging but never closes the connection holds the
++// handler until finishTimeout: the idle timeout, configured here at a third
++// of it, does not bound the wait on its own because the pings reset the SPDY
++// idle timer. A silent client would be cut off by the idle timeout instead
++// and make the elapsed-time check below fail.
++func TestServeExecFinishTimeoutBoundsWaitForClient(t *testing.T) {
++	const timeout = 300 * time.Millisecond
++	previous := finishTimeout
++	finishTimeout = timeout
++	t.Cleanup(func() { finishTimeout = previous })
++
++	server, serverDone := execServer(t, &payloadExecutor{size: 1 << 20}, timeout/3)
++	start := time.Now()
++	conn, _, stdout, errorStream := spdyExecClient(t, server.URL+"/exec?output=1", 20*time.Millisecond, false)
++	statusCh := readStatus(t, errorStream)
++
++	got := readSlowly(t, stdout, 0)
++	<-statusCh
++	if got != 1<<20 {
++		t.Errorf("got %d bytes, want %d", got, 1<<20)
++	}
++
++	waitFor(t, serverDone, "ServeExec to return after finishTimeout")
++	elapsed := time.Since(start)
++	if elapsed < timeout {
++		t.Errorf("ServeExec returned %v after the session started, before finishTimeout %v: it did not wait for the client", elapsed, timeout)
++	}
++	if elapsed > 10*timeout {
++		t.Errorf("ServeExec returned %v after the session started, finishTimeout is %v", elapsed, timeout)
++	}
++	waitFor(t, closedChan(conn.CloseChan()), "the client connection to be closed")
++}
++
++// Input the client keeps sending after the command has exited is discarded
++// and does not stall the connection.
++func TestServeExecDiscardsInputAfterCommandExit(t *testing.T) {
++	server, serverDone := execServer(t, &payloadExecutor{size: 1 << 20}, time.Minute)
++	conn, stdin, stdout, errorStream := spdyExecClient(t, server.URL+"/exec?input=1&output=1", 0, true)
++	statusCh := readStatus(t, errorStream)
++
++	// Keep writing to stdin, which the command never reads, until the test ends.
++	stop := make(chan struct{})
++	var writer sync.WaitGroup
++	writer.Go(func() {
++		chunk := make([]byte, 64<<10)
++		for {
++			select {
++			case <-stop:
++				return
++			default:
++			}
++			if _, err := stdin.Write(chunk); err != nil {
++				return
++			}
++		}
++	})
++
++	got := readSlowly(t, stdout, 0)
++	status := <-statusCh
++	if got != 1<<20 {
++		t.Errorf("got %d bytes, want %d", got, 1<<20)
++	}
++	expectSuccess(t, status)
++
++	select {
++	case <-serverDone:
++		t.Fatal("ServeExec returned before the client closed the connection")
++	case <-time.After(300 * time.Millisecond):
++	}
++
++	_ = conn.Close()
++	close(stop)
++	writer.Wait()
++	waitFor(t, serverDone, "ServeExec to return after the client closed the connection")
++}
++
++// wsExecSession runs an exec session over WebSocket with a client that reads
++// stdout slowly and pings the server like client-go does. With floodStdin it
++// also keeps writing to stdin until the session ends. It returns the number of
++// stdout bytes received, the status and the read error that ended the session.
++func wsExecSession(t *testing.T, url string, pause time.Duration, floodStdin bool) (got int, status []byte, readErr error) {
++	t.Helper()
++	dialer := gwebsocket.Dialer{
++		Subprotocols:   []string{v4BinaryWebsocketProtocol},
++		NetDialContext: smallReceiveBufferDialer().DialContext,
++	}
++	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(url, "http"), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = conn.Close() }()
++	if conn.Subprotocol() != v4BinaryWebsocketProtocol {
++		t.Fatalf("negotiated %q, want %q", conn.Subprotocol(), v4BinaryWebsocketProtocol)
++	}
++
++	// On return: stop the writers, close the connection so that a writer blocked
++	// in a send returns, then wait for them.
++	stop := make(chan struct{})
++	var writers sync.WaitGroup
++	defer writers.Wait()
++	defer func() { _ = conn.Close() }()
++	defer close(stop)
++	writers.Go(func() {
++		ticker := time.NewTicker(fastPings)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-stop:
++				return
++			case <-ticker.C:
++				_ = conn.WriteControl(gwebsocket.PingMessage, nil, time.Now().Add(time.Second))
++			}
++		}
++	})
++	if floodStdin {
++		writers.Go(func() {
++			message := make([]byte, 1+64<<10)
++			message[0] = stdinChannel
++			for {
++				select {
++				case <-stop:
++					return
++				default:
++				}
++				if err := conn.WriteMessage(gwebsocket.BinaryMessage, message); err != nil {
++					return
++				}
++			}
++		})
++	}
++
++	for {
++		_, r, err := conn.NextReader()
++		if err != nil {
++			var closeErr *gwebsocket.CloseError
++			if errors.As(err, &closeErr) && closeErr.Code == gwebsocket.CloseNormalClosure {
++				return got, status, nil
++			}
++			return got, status, err
++		}
++		var id [1]byte
++		if _, err := io.ReadFull(r, id[:]); err != nil {
++			t.Fatalf("read channel id: %v", err)
++		}
++		data, err := io.ReadAll(r)
++		if err != nil {
++			t.Fatalf("read message: %v", err)
++		}
++		switch id[0] {
++		case stdoutChannel:
++			got += len(data)
++			time.Sleep(pause)
++		case errorChannel:
++			status = append(status, data...)
++		}
++	}
++}
++
++func TestServeExecWebSocketSlowClientReceivesAllOutput(t *testing.T) {
++	server, serverDone := execServer(t, &payloadExecutor{size: slowPayload}, time.Minute)
++
++	start := time.Now()
++	got, status, err := wsExecSession(t, server.URL+"/exec?output=1", slowReadPause, false)
++	elapsed := time.Since(start)
++	waitFor(t, serverDone, "ServeExec to return after the client closed the connection")
++
++	t.Logf("received %d of %d bytes in %v, status %q, err %v", got, slowPayload, elapsed.Round(time.Millisecond), status, err)
++	if err != nil {
++		t.Errorf("session did not end with a normal closure: %v", err)
++	}
++	if got != slowPayload {
++		t.Errorf("stdout truncated: got %d bytes, want %d (lost %d)", got, slowPayload, slowPayload-got)
++	}
++	expectSuccess(t, status)
++}
++
++func TestServeExecWebSocketDiscardsInputAfterCommandExit(t *testing.T) {
++	server, serverDone := execServer(t, &payloadExecutor{size: 1 << 20}, time.Minute)
++
++	got, status, err := wsExecSession(t, server.URL+"/exec?input=1&output=1", 0, true)
++	waitFor(t, serverDone, "ServeExec to return after the client closed the connection")
++
++	if err != nil {
++		t.Errorf("session did not end with a normal closure: %v", err)
++	}
++	if got != 1<<20 {
++		t.Errorf("got %d bytes, want %d", got, 1<<20)
++	}
++	expectSuccess(t, status)
++}
+diff --git a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_unix_test.go b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_unix_test.go
+new file mode 100644
+index 0000000000000..23330c3b201d8
+--- /dev/null
++++ b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_unix_test.go
+@@ -0,0 +1,44 @@
++//go:build !windows
++
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package remotecommand
++
++import (
++	"net"
++	"syscall"
++)
++
++// smallReceiveBufferDialer returns a dialer whose sockets have a small, fixed
++// receive buffer. Output the client has not read yet then backs up in the
++// server's send buffer rather than in the client's receive buffer, which is
++// what a server that closes the socket too early discards; without it the
++// kernel's receive buffer autotuning can absorb the whole output and hide the
++// loss.
++func smallReceiveBufferDialer() *net.Dialer {
++	return &net.Dialer{
++		Control: func(_, _ string, c syscall.RawConn) error {
++			var err error
++			if cerr := c.Control(func(fd uintptr) {
++				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 64<<10)
++			}); cerr != nil {
++				return cerr
++			}
++			return err
++		},
++	}
++}
+diff --git a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_windows_test.go b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_windows_test.go
+new file mode 100644
+index 0000000000000..aa1a68568498d
+--- /dev/null
++++ b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/slowclient_windows_test.go
+@@ -0,0 +1,28 @@
++//go:build windows
++
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package remotecommand
++
++import "net"
++
++// smallReceiveBufferDialer returns a plain dialer on Windows, where the tests
++// still check that the fix delivers everything but cannot pin the socket
++// buffers to make the old code fail reliably.
++func smallReceiveBufferDialer() *net.Dialer {
++	return &net.Dialer{}
++}
+diff --git a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/websocket.go b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/websocket.go
+index 3bbeeddb3e6cb..1266b315f6ac6 100644
+--- a/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/websocket.go
++++ b/staging/src/k8s.io/cri-streaming/pkg/streaming/remotecommand/websocket.go
+@@ -18,6 +18,7 @@ package remotecommand
+ 
+ import (
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"time"
+ 
+@@ -117,8 +118,18 @@ func createWebSocketStreams(req *http.Request, w http.ResponseWriter, opts *Opti
+ 		stdinStream:  streams[stdinChannel],
+ 		stdoutStream: streams[stdoutChannel],
+ 		stderrStream: streams[stderrChannel],
++		errorStream:  streams[errorChannel],
+ 		tty:          opts.TTY,
+ 		resizeStream: streams[resizeChannel],
++		stopInput: func() {
++			// Closing a read channel discards what the client still sends on it.
++			for _, s := range []io.ReadCloser{streams[stdinChannel], streams[resizeChannel]} {
++				_ = s.Close()
++			}
++		},
++		endOutput: func() {
++			_ = conn.CloseWrite()
++		},
+ 	}
+ 
+ 	switch negotiatedProtocol {
+diff --git a/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn.go b/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn.go
+index eae80ab4d3dc7..94b7952e80285 100644
+--- a/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn.go
++++ b/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn.go
+@@ -18,6 +18,8 @@ package wsstream
+ 
+ import (
+ 	"encoding/base64"
++	"encoding/binary"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -65,6 +67,9 @@ const Base64ChannelWebSocketProtocol = "base64.channel.k8s.io"
+ 
+ const streamCloseSignal = 255
+ 
++// closeStatusNormal is the WebSocket close status for a normal closure.
++const closeStatusNormal = 1000
++
+ type codecType int
+ 
+ const (
+@@ -189,8 +194,12 @@ type Conn struct {
+ 	channels         []*websocketChannel
+ 	codec            codecType
+ 	ready            chan struct{}
+-	ws               *websocket.Conn
+-	timeout          time.Duration
++	// ws is written to through codecs: the channel codec in write and
++	// closeFrameCodec in CloseWrite.
++	ws      *websocket.Conn
++	timeout time.Duration
++	// closeChan is closed once the connection's read loop has ended.
++	closeChan chan bool
+ }
+ 
+ // NewConn creates a WebSocket connection that supports a set of channels. Channels begin each
+@@ -204,6 +213,7 @@ func NewConn(protocols map[string]ChannelProtocolConfig) *Conn {
+ 	return &Conn{
+ 		ready:     make(chan struct{}),
+ 		protocols: protocols,
++		closeChan: make(chan bool),
+ 	}
+ }
+ 
+@@ -320,6 +330,40 @@ func (conn *Conn) Close() error {
+ 	return conn.closeNonThreadSafe()
+ }
+ 
++// CloseChan returns a channel that is closed once the connection has been
++// closed: the client closed it, the idle timeout expired, or Close was called.
++func (conn *Conn) CloseChan() <-chan bool {
++	return conn.closeChan
++}
++
++// CloseWrite tells the client that the server is done with the connection
++// without closing it. It sends a close frame, to which the client replies
++// with its own close frame, at which point the read loop ends and the
++// connection is closed (see CloseChan). Output still in the socket's send
++// buffer keeps flowing to the client in the meantime, whereas Close tears the
++// socket down immediately and lets the kernel reset the connection if the
++// client sends anything after that, discarding the output that was still in
++// flight. A client that never replies holds the connection until the idle
++// timeout, if one is set, or until the caller closes it. Close, which the
++// read loop calls when it ends, sends a second close frame; by then the client
++// has closed or ignores it.
++func (conn *Conn) CloseWrite() error {
++	<-conn.ready
++	status := make([]byte, 2)
++	binary.BigEndian.PutUint16(status, closeStatusNormal)
++	return closeFrameCodec.Send(conn.ws, status)
++}
++
++// closeFrameCodec sends its payload as a close frame. x/net/websocket only
++// sends a close frame as part of Close, which also closes the socket; Codec.Send
++// takes the connection's write lock and uses the frame type Marshal returns, so
++// it can send one on its own.
++var closeFrameCodec = websocket.Codec{
++	Marshal: func(v interface{}) ([]byte, byte, error) {
++		return v.([]byte), websocket.CloseFrame, nil
++	},
++}
++
+ // protocolSupportsStreamClose returns true if the passed protocol
+ // supports the stream close signal (currently only V5 remotecommand);
+ // false otherwise.
+@@ -335,6 +379,7 @@ func protocolSupportsWebsocketTunneling(protocol string) bool {
+ 
+ // handle implements a websocket handler.
+ func (conn *Conn) handle(ws *websocket.Conn) {
++	defer close(conn.closeChan)
+ 	conn.initialize(ws)
+ 	defer conn.Close()
+ 	supportsStreamClose := protocolSupportsStreamClose(conn.selectedProtocol)
+@@ -442,18 +487,28 @@ func (p *websocketChannel) DataFromSocket(data []byte) (int, error) {
+ 
+ 	switch p.conn.codec {
+ 	case rawCodec:
+-		return p.w.Write(data)
++		return p.writeToReader(data)
+ 	case base64Codec:
+ 		dst := make([]byte, len(data))
+ 		n, err := base64.StdEncoding.Decode(dst, data)
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		return p.w.Write(dst[:n])
++		return p.writeToReader(dst[:n])
+ 	}
+ 	return 0, nil
+ }
+ 
++// writeToReader hands data received from the socket to the channel's reader.
++// Data for a channel that has been closed is discarded.
++func (p *websocketChannel) writeToReader(data []byte) (int, error) {
++	n, err := p.w.Write(data)
++	if errors.Is(err, io.ErrClosedPipe) {
++		return len(data), nil
++	}
++	return n, err
++}
++
+ func (p *websocketChannel) Read(data []byte) (int, error) {
+ 	if !p.read {
+ 		return 0, io.EOF
+diff --git a/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn_test.go b/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn_test.go
+index a4122a625796f..7e500ec1f1426 100644
+--- a/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn_test.go
++++ b/staging/src/k8s.io/streaming/pkg/httpstream/wsstream/conn_test.go
+@@ -24,6 +24,7 @@ import (
+ 	"reflect"
+ 	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"golang.org/x/net/websocket"
+ )
+@@ -419,3 +420,55 @@ func TestProtocolSupportsStreamClose(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// CloseWrite sends the close frame without closing the socket: the client
++// reads everything written before it and then EOF, the server's PayloadType
++// is left as it was, and the connection is closed, and CloseChan with it, only
++// once the client has replied.
++func TestCloseWrite(t *testing.T) {
++	conn := NewConn(NewDefaultChannelProtocols([]ChannelType{WriteChannel}))
++	s, addr := newServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		_, _, _ = conn.Open(w, req)
++	}))
++	defer s.Close()
++
++	client, err := websocket.Dial("ws://"+addr, "", "http://localhost/")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = client.Close() }()
++	<-conn.ready
++
++	if _, err := conn.channels[0].Write([]byte("last words")); err != nil {
++		t.Fatal(err)
++	}
++	payloadType := conn.ws.PayloadType
++	if err := conn.CloseWrite(); err != nil {
++		t.Fatal(err)
++	}
++	if conn.ws.PayloadType != payloadType {
++		t.Errorf("CloseWrite left PayloadType %d, want %d", conn.ws.PayloadType, payloadType)
++	}
++
++	data, err := io.ReadAll(client)
++	if err != nil {
++		t.Fatalf("client read: %v", err)
++	}
++	if !reflect.DeepEqual(data, append([]byte{0}, []byte("last words")...)) {
++		t.Errorf("unexpected client read: %q", data)
++	}
++
++	// The client has read up to the close frame but has not replied.
++	select {
++	case <-conn.CloseChan():
++		t.Fatal("the connection was closed before the client replied to the close frame")
++	case <-time.After(200 * time.Millisecond):
++	}
++
++	_ = client.Close()
++	select {
++	case <-conn.CloseChan():
++	case <-time.After(10 * time.Second):
++		t.Fatal("the connection was not closed after the client replied")
++	}
++}

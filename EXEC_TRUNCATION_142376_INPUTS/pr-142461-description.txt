@@ -1,0 +1,45 @@
+TITLE: exec/attach: let the client close the connection so no output is lost
+STATE: open merged=false
+AUTHOR: semx
+HEAD: fce8f6619eafb086dd9e7288cac7c11c02bdfc87
+BASE: master
+
+#### What type of PR is this?
+
+/kind bug
+
+#### What this PR does / why we need it:
+
+`kubectl exec` and `attach` lose the end of the output when the client reads more slowly than the command writes and is also sending input (#142376). The server writes the status and closes the connection at once; the client's next frame then makes the kernel reset the connection and drop what is still in the send buffer. Over SPDY, client-go then sees an empty status and reports success.
+
+The change:
+
+- The CRI streaming server (`k8s.io/cri-streaming`) and the WebSocket translator no longer close first. They send the status, signal the end (SPDY: close the output streams; WebSocket: a close frame, new `wsstream.Conn.CloseWrite`), and wait for the client to close, bounded by the request context and 15 minutes.
+- client-go treats an empty status stream on v4/v5 as an error (`connection closed before the command's status was received`) instead of success.
+
+Behaviour change: a client that neither closes nor answers the close frame now holds the session for up to 15 minutes after the command exits (the old code returned at once).
+
+Tested with unit tests that reproduce the loss on the old code, and on a real multi-node cluster with containerd, CRI-O and Windows; results in https://github.com/kubernetes/kubernetes/pull/142461#issuecomment-5920263856.
+
+#### Which issue(s) this PR is related to:
+
+Fixes #142376
+
+Related: #60140, #124571
+
+#### Special notes for your reviewer:
+
+Reading order: `finish` in `cri-streaming/pkg/streaming/remotecommand/httpstream.go`, `CloseWrite`/`CloseChan` in `streaming/pkg/httpstream/wsstream/conn.go`, the translator in `apiserver/pkg/util/proxy`, the client-go check in `tools/remotecommand`. The runtimes vendor the server, so they need a bump or port after this merges (plan in #142376).
+
+Credits: the report and first reproduction are @knoppiks's; @herefindalex isolated the close sequence; @thc1006 reproduced it on four nodes and found the mixed-version case in review.
+
+#### Does this PR introduce a user-facing change?
+
+```release-note
+Fixed `kubectl exec`, `kubectl attach` and `crictl exec` losing the end of the output when the client read more slowly than the command wrote; over SPDY `kubectl exec` could also exit 0 with truncated output. The CRI streaming server and the WebSocket translator now wait up to 15 minutes for the client to close the connection after the command exits, and client-go reports an error when the command's status is missing.
+```
+
+#### AI usage disclosure:
+
+YES. Used to check the diagnosis and fix against the source (a second pass after my own), and to help draft and format this description.
+

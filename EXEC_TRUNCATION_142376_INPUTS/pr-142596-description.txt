@@ -1,0 +1,32 @@
+TITLE: wsstream: keep a write deadline across writes
+STATE: open merged=false
+AUTHOR: semx
+HEAD: bc25b1b2e9da73521d3fb736caf7ab9f66402eac
+BASE: master
+
+#### What type of PR is this?
+
+/kind bug
+
+#### What this PR does / why we need it:
+
+`wsstream.Conn` renews its idle timeout with `SetDeadline` on every frame it reads or writes, and that sets the write deadline as well. So a deadline set with `SetWriteDeadline` lasts only until the next frame is written, which is usually the very write it was meant to bound. The WebSocket-to-SPDY stream translator (in the apiserver, and in the kubelet with `ExtendWebSocketsToKubelet`) sets `writeErrorDeadline` (10s) before it writes the final status of an exec or attach session; that write is bounded by the idle timeout instead, 4h by default. A peer that stops reading by then keeps the handler for that long.
+
+The idle timeout now renews the read deadline, and the write deadline only up to the one `SetWriteDeadline` set.
+
+The new test fills the socket of a client that does not read. With a 200ms write deadline and a 10s idle timeout, the writes fail after 200ms; without the change they fail after 10s.
+
+#### Which issue(s) this PR is related to:
+
+Found while measuring #142461: https://github.com/kubernetes/kubernetes/issues/142376#issuecomment-5933424777
+
+#### Special notes for your reviewer:
+
+The only caller of `wsstream.Conn.SetWriteDeadline` on master is `writeStatus` in `staging/src/k8s.io/apiserver/pkg/util/proxy/websocket.go`, so the visible effect is that its 10s bound on the status write now holds. Writes of stdout and stderr have no write deadline and stay bounded by the idle timeout, as before; port-forward does not set one either. Tests in `k8s.io/streaming/...`, `k8s.io/apiserver/pkg/util/proxy`, `k8s.io/cri-streaming/...` and `client-go/tools/{remotecommand,portforward}` pass; the wsstream package passes `-race -count=5`.
+
+#### Does this PR introduce a user-facing change?
+
+```release-note
+kube-apiserver, kubelet: the WebSocket exec/attach translator now honors the 10s write deadline on the final status message; before, a client that had stopped reading could hold the connection there until the 4h idle timeout.
+```
+

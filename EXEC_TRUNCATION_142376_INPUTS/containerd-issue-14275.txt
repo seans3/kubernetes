@@ -1,0 +1,8 @@
+TITLE: exec/attach on release/2.2 lose the end of the output with slow clients
+STATE: open
+AUTHOR: semx
+
+kubernetes/kubernetes#142376: when a client reads `exec`/`attach` output more slowly than the command writes it, the end of the output is lost, and over SPDY kubectl still exits 0. As kubernetes/kubernetes#142461 (in review) explains it, the server writes the exit status and closes at once, and the next frame the client sends (input, for example) makes the kernel reset the connection and drop what is still buffered. This is the stdout side; #13934 is a different, stdin-side problem.
+
+main and release/2.3+ get the server from `k8s.io/cri-streaming` and will pick up the fix with a bump once a release contains it. release/2.2 has its own copy in `internal/cri/streamingserver`, so it needs a port. I have one ready and tested on a 2.2 node: output was cut off in 30/30 runs before and complete in 20/20 after (with a kubelet that has #142461; behind an older kubelet, SPDY is fixed but WebSocket is still cut off by that kubelet's own translator). I'd open it as a draft until the upstream PR merges, if that works for you.
+
